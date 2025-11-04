@@ -36,12 +36,12 @@ DEG = STATE_BITS.sum(axis=1)
 N_STATES = STATE_BITS.shape[0]
 
 
-def _pair_matrix(lambda_edge: float, hard: float, axis: str) -> np.ndarray:
+def _pair_matrix(lambda_edge: float, mismatch_penalty: float, axis: str) -> np.ndarray:
     """Create pairwise factor matrix for edge consistency.
 
     Args:
         lambda_edge: Penalty weight for using an edge (encourages shorter paths)
-        hard: Large negative weight for forbidden configurations
+        mismatch_penalty: Penalty for edge mismatches (adjustable for annealing)
         axis: Either 'h' (horizontal) or 'v' (vertical)
             - 'h': enforce left.E == right.W
             - 'v': enforce top.S == bottom.N
@@ -49,7 +49,8 @@ def _pair_matrix(lambda_edge: float, hard: float, axis: str) -> np.ndarray:
     Returns:
         N_STATES x N_STATES matrix of pairwise weights
     """
-    W = np.full((N_STATES, N_STATES), -hard, dtype=np.float32)
+    # Use soft penalty for mismatches - strength controlled by caller
+    W = np.full((N_STATES, N_STATES), -mismatch_penalty, dtype=np.float32)
 
     if axis == "h":
         for a in range(N_STATES):
@@ -102,6 +103,7 @@ def build_thrml_program(
     beta: float = 5.0,
     lambda_edge: float = 0.05,
     hard: float = 1e6,
+    constraint_strength: float = 10.0,  # NEW: adjustable constraint strength for annealing
 ):
     """Build THRML sampling program for maze solving.
 
@@ -126,10 +128,10 @@ def build_thrml_program(
     # Compute distance fields from BOTH start and goal (bidirectional gradient)
     distances_from_goal = _compute_distance_field(maze, goal)
     distances_from_start = _compute_distance_field(maze, start)
-    
+
     max_dist_goal = np.max(distances_from_goal[distances_from_goal != np.inf])
     max_dist_start = np.max(distances_from_start[distances_from_start != np.inf])
-    
+
     if max_dist_goal == 0:
         max_dist_goal = 1.0
     if max_dist_start == 0:
@@ -161,16 +163,19 @@ def build_thrml_program(
     goal_set = {goal}
 
     # Distance potential strength - creates the "water flow" gradient
-    # Bidirectional: pulls from start AND toward goal
-    alpha = 4.0
-    
+    # Balance: strong enough to guide, weak enough to allow exploration
+    # With constraint_strength=10, we need gentle guidance
+    alpha = 0.3  # Gentle gradient - works with soft constraints
+    bridge_bonus = 0.2  # Subtle bridge bonus
+
     # Optimal path length (if path exists)
     optimal_dist = distances_from_goal[start]
-    if optimal_dist == np.inf:
-        optimal_dist = max_dist_goal  # No path exists, use max as fallback
-    
+    if optimal_dist == np.inf or optimal_dist == 0:
+        optimal_dist = max(max_dist_goal, 1.0)  # No path exists or start==goal, use safe fallback
+
     for idx, coord in enumerate(coords):
         if maze[coord] == 1:  # wall
+            # Use HARD wall constraints - walls are absolute boundaries
             W_unary[idx, :] = -hard
             W_unary[idx, 0] = 0.0  # force empty
         else:
@@ -180,35 +185,36 @@ def build_thrml_program(
             else:
                 allowed = (DEG == 0) | (DEG == 2)  # interior: empty or path-through
             W_unary[idx, allowed] = 0.0
-            
+
             # Add bidirectional distance potential (water flows from start to goal)
             dist_to_goal = distances_from_goal[coord]
             dist_from_start = distances_from_start[coord]
-            
+
             if dist_to_goal != np.inf and dist_from_start != np.inf:
                 if coord not in (start_set | goal_set):
-                    # Total distance through this cell
-                    total_dist = dist_from_start + dist_to_goal
-                    
-                    # Reward cells on or near the optimal path
-                    # If total_dist ≈ optimal_dist, this cell is on shortest path
-                    path_deviation = abs(total_dist - optimal_dist)
-                    
-                    # Normalize distances
+                    # Normalize distances (0 = at endpoint, 1 = farthest away)
                     norm_dist_to_goal = dist_to_goal / max_dist_goal
                     norm_dist_from_start = dist_from_start / max_dist_start
-                    
+
                     for state in range(N_STATES):
                         if DEG[state] > 0 and allowed[state]:  # If this is a path tile
-                            # Strong reward for cells on optimal path
-                            on_path_bonus = alpha * (1.0 - path_deviation / optimal_dist)
-                            
-                            # Additional reward for being close to BOTH endpoints
-                            proximity_bonus = alpha * 0.5 * (
-                                (1.0 - norm_dist_to_goal) + (1.0 - norm_dist_from_start)
-                            )
-                            
-                            W_unary[idx, state] += on_path_bonus + proximity_bonus
+                            # Bidirectional search: encourage path growth from BOTH endpoints
+
+                            # Base attraction from each endpoint
+                            start_pull = alpha * (1.0 - norm_dist_from_start)
+                            goal_pull = alpha * (1.0 - norm_dist_to_goal)
+
+                            # Use average so both endpoints contribute
+                            # (max would only use the stronger pull)
+                            base_reward = (start_pull + goal_pull) / 2.0
+
+                            # Bridge bonus: extra reward for cells accessible from BOTH sides
+                            # These are the cells that can connect the two growing paths
+                            # Highest bonus in the middle, decreases toward endpoints
+                            accessibility = (1.0 - norm_dist_from_start) * (1.0 - norm_dist_to_goal)
+                            bridge_reward = bridge_bonus * accessibility
+
+                            W_unary[idx, state] += base_reward + bridge_reward
 
     # Pairwise weights for each neighbor direction
     # Build edge lists once per direction so factor batches align properly
@@ -224,12 +230,37 @@ def build_thrml_program(
                 u_down.append(coord_to_node[(i, j)])
                 v_down.append(coord_to_node[(i + 1, j)])
 
-    Wh = _pair_matrix(lambda_edge, hard, axis="h")
-    Wv = _pair_matrix(lambda_edge, hard, axis="v")
+    Wh = _pair_matrix(lambda_edge, constraint_strength, axis="h")
+    Wv = _pair_matrix(lambda_edge, constraint_strength, axis="v")
+
+    # ADD: Activation spreading - neighbors prefer similar activity levels
+    # This creates wave-like propagation naturally through sampling!
+    activation_coupling = 1.5  # Strength of spreading
+    Wh_spread = np.zeros((N_STATES, N_STATES), dtype=np.float32)
+    Wv_spread = np.zeros((N_STATES, N_STATES), dtype=np.float32)
+
+    for a in range(N_STATES):
+        for b in range(N_STATES):
+            # Reward when neighbors have similar "activity" (degree)
+            deg_a, deg_b = DEG[a], DEG[b]
+
+            # If both active (deg > 0), give bonus
+            if deg_a > 0 and deg_b > 0:
+                # Stronger bonus if both are deg=2 (corridor forming)
+                if deg_a == 2 and deg_b == 2:
+                    Wh_spread[a, b] = activation_coupling * 1.5
+                    Wv_spread[a, b] = activation_coupling * 1.5
+                else:
+                    Wh_spread[a, b] = activation_coupling
+                    Wv_spread[a, b] = activation_coupling
+            # Small bonus even if one is empty and other deg=1 (allows initiation)
+            elif (deg_a == 0 and deg_b == 1) or (deg_a == 1 and deg_b == 0):
+                Wh_spread[a, b] = activation_coupling * 0.3
+                Wv_spread[a, b] = activation_coupling * 0.3
 
     weights_unary = beta * jnp.asarray(W_unary)
-    weights_h = beta * jnp.broadcast_to(jnp.asarray(Wh), (len(u_right), N_STATES, N_STATES))
-    weights_v = beta * jnp.broadcast_to(jnp.asarray(Wv), (len(u_down), N_STATES, N_STATES))
+    weights_h = beta * jnp.broadcast_to(jnp.asarray(Wh + Wh_spread), (len(u_right), N_STATES, N_STATES))
+    weights_v = beta * jnp.broadcast_to(jnp.asarray(Wv + Wv_spread), (len(u_down), N_STATES, N_STATES))
 
     # Build factors
     unary_factor = CategoricalEBMFactor([Block(nodes)], weights_unary)

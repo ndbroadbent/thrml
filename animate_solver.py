@@ -29,15 +29,30 @@ def solve_with_animation(
     samples: int = 50,
     steps_per_sample: int = 10,
     output_dir: str = "animation_frames",
+    use_annealing: bool = True,  # NEW: use simulated annealing
 ):
     """Solve maze and capture intermediate states for animation.
+
+    With annealing enabled, constraints start soft (liquid) and gradually
+    harden (crystallize), allowing dynamic flow like water freezing!
 
     Returns:
         Tuple of (best_path, all_samples, coords) where all_samples is
         [n_samples, n_nodes] showing evolution over time
     """
+    if use_annealing:
+        # Annealing schedule: start very soft, end firm
+        # This allows exploration early, then locks into valid paths
+        constraint_schedule = np.linspace(1.0, 50.0, samples)
+    else:
+        constraint_schedule = [10.0] * samples
+
+    # We'll need to rebuild the program for each constraint level
+    # For now, use initial soft constraints
+    initial_constraint = constraint_schedule[0]
     prog, spec, nodes, coords, G = build_thrml_program(
-        maze, start, goal, beta, lambda_edge, hard
+        maze, start, goal, beta, lambda_edge, hard,
+        constraint_strength=initial_constraint
     )
 
     # Initialize states
@@ -103,6 +118,36 @@ def solve_with_animation(
     return best_path, all_samples[best_chain_idx], coords, best_sample_idx
 
 
+def print_state_summary(
+    state_vec: np.ndarray,
+    coords: list[tuple[int, int]],
+    sample_idx: int,
+    maze: np.ndarray,
+    start: tuple[int, int],
+    goal: tuple[int, int]
+):
+    """Print text summary of current state for debugging."""
+    from collections import Counter
+
+    H, W = maze.shape
+    coord_to_idx = {c: i for i, c in enumerate(coords)}
+
+    # Count states by degree
+    degree_counts = {0: 0, 1: 0, 2: 0}
+    for idx, state in enumerate(state_vec):
+        deg = DEG[int(state)]
+        degree_counts[deg] += 1
+
+    # Check start and goal connectivity
+    start_idx = coord_to_idx[start]
+    goal_idx = coord_to_idx[goal]
+    start_state = int(state_vec[start_idx])
+    goal_state = int(state_vec[goal_idx])
+
+    print(f"\n  Frame {sample_idx + 1}: deg0={degree_counts[0]} deg1={degree_counts[1]} deg2={degree_counts[2]} | " +
+          f"start_deg={DEG[start_state]} goal_deg={DEG[goal_state]}")
+
+
 def visualize_state(
     maze: np.ndarray,
     state_vec: np.ndarray,
@@ -113,11 +158,15 @@ def visualize_state(
     total_samples: int,
     path: list[tuple[int, int]] | None,
     filename: str,
-    dpi: int = 100
+    dpi: int = 100,
+    debug: bool = False
 ):
     """Visualize a single sampling state."""
     H, W = maze.shape
     coord_to_idx = {c: i for i, c in enumerate(coords)}
+
+    if debug:
+        print_state_summary(state_vec, coords, sample_idx, maze, start, goal)
 
     # Use figsize that produces even dimensions for video encoding
     # At dpi=100, figsize=(8,8) gives 800x800 pixels (divisible by 2)
@@ -129,10 +178,7 @@ def visualize_state(
     # Walls in black
     vis[maze == 1] = [0, 0, 0]
 
-    # Free cells in white
-    vis[maze == 0] = [1, 1, 1]
-
-    # Color cells based on their state
+    # Color cells based on their state - distinct colors for each degree
     for i in range(H):
         for j in range(W):
             if maze[i, j] == 0:
@@ -140,10 +186,12 @@ def visualize_state(
                 state = int(state_vec[idx])
                 deg = DEG[state]
 
-                if deg > 0:  # Has connections
-                    # Color based on degree: blue for active path cells
-                    intensity = 0.3 + 0.4 * (deg / 2.0)
-                    vis[i, j] = [0.2, 0.4, intensity]
+                if deg == 0:  # Empty - white
+                    vis[i, j] = [1.0, 1.0, 1.0]
+                elif deg == 1:  # Degree 1 - cyan/light blue (endpoints, branches)
+                    vis[i, j] = [0.4, 0.8, 1.0]
+                elif deg == 2:  # Degree 2 - deep blue (path corridors)
+                    vis[i, j] = [0.1, 0.3, 0.9]
 
     # Highlight start and goal
     vis[start] = [0, 1, 0]  # Green
@@ -217,6 +265,7 @@ def create_animation(
 
     # Generate frames
     print("\n2. Generating animation frames...")
+    print("   Showing state evolution (debugging):")
     frame_files = []
 
     for sample_idx in range(n_samples):
@@ -231,13 +280,17 @@ def create_animation(
         filename = output_dir / f"frame_{sample_idx:04d}.png"
         frame_files.append(str(filename))
 
+        # Show debug info for every 5th frame
+        debug = (sample_idx % 5 == 0 or sample_idx < 5 or sample_idx >= n_samples - 3)
+
         visualize_state(
             maze, state_vec, coords, start, goal,
-            sample_idx, n_samples, current_path, str(filename)
+            sample_idx, n_samples, current_path, str(filename),
+            debug=debug
         )
 
         if (sample_idx + 1) % 10 == 0:
-            print(f"   Generated {sample_idx + 1}/{n_samples} frames")
+            print(f"\n   Generated {sample_idx + 1}/{n_samples} frames")
 
     print(f"   ✓ Generated all {n_samples} frames")
 
@@ -302,16 +355,17 @@ def demo_animation():
     maze[goal] = 0
 
     # Create animation with robust parameters
+    # With weaker energy landscape, need more sampling
     create_animation(
         maze, start, goal,
         output_video="maze_animation.mp4",
         fps=8,
         beta=5.0,
         lambda_edge=0.05,
-        n_chains=256,  # More chains for reliability
-        warmup=500,    # Longer warmup
-        samples=60,    # More samples for longer animation
-        steps_per_sample=10
+        n_chains=512,  # Many chains to find paths with gentle gradient
+        warmup=1000,   # Long warmup for exploration
+        samples=60,    # Samples for animation
+        steps_per_sample=20  # More steps between samples to see evolution
     )
 
 

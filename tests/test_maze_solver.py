@@ -143,10 +143,10 @@ def test_simple_maze_solvable():
         maze, start, goal,
         beta=5.0,
         lambda_edge=0.05,
-        n_chains=96,
-        warmup=400,
-        samples=30,
-        steps_per_sample=10
+        n_chains=256,  # More chains with soft constraints
+        warmup=800,    # More warmup for exploration
+        samples=50,
+        steps_per_sample=15
     )
 
     # Should find a path
@@ -178,10 +178,10 @@ def test_maze_with_wall():
         maze, start, goal,
         beta=5.0,
         lambda_edge=0.05,
-        n_chains=128,
-        warmup=400,
-        samples=30,
-        steps_per_sample=10
+        n_chains=256,
+        warmup=800,
+        samples=50,
+        steps_per_sample=15
     )
 
     # Should find a path (going around the single wall cell)

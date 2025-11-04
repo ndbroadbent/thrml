@@ -127,44 +127,36 @@ pytest -n auto tests/
 
 ## Creating Animations
 
-Watch the solver in action! Create a video showing the sampling process:
+Watch the solver in action with real sampling dynamics!
 
 ```bash
 python animate_solver.py
 ```
 
-This will:
-1. Run the solver and capture intermediate sampling states
-2. Generate frames showing the solution emerging over time
-3. Use `ffmpeg` to create a video (requires: `brew install ffmpeg`)
-4. Output: `maze_animation.mp4`
+This creates a video showing how the solution emerges over time. You'll see:
+- **Dynamic flow**: Cells actively rearranging as sampling explores configurations
+- **Water-like behavior**: Path "liquid" flowing from both start and goal
+- **Gradual crystallization**: Solution emerges as sampling converges
 
-The animation shows:
-- **White**: Free cells
-- **Black**: Walls
-- **Blue**: Active path tiles (darker = higher degree)
-- **Yellow**: Valid path (when found)
+**The Secret: Soft Constraints!**
+- Uses **soft** penalties (-10) instead of hard constraints (-1e6)
+- Allows Gibbs sampling to explore and rearrange (like water flowing)
+- Distance potentials create bidirectional gradient (like gravity)
+- Balance between constraint satisfaction and exploration
+
+**Color Legend:**
+- **White**: Empty cells (degree 0)
+- **Cyan/Light Blue**: Degree-1 cells (endpoints, branches)
+- **Deep Blue**: Degree-2 cells (path corridors)
 - **Green**: Start
 - **Red**: Goal
+- **Yellow**: Valid path (when found)
 
-You can also create custom animations:
-
-```python
-from animate_solver import create_animation
-import numpy as np
-
-maze = np.zeros((32, 32), dtype=np.uint8)
-# ... add obstacles ...
-
-create_animation(
-    maze, start=(0, 0), goal=(31, 31),
-    output_video="my_maze.mp4",
-    fps=10,
-    n_chains=128,
-    warmup=500,
-    samples=60
-)
-```
+**Key Insight for Thermodynamic Computing:**
+This demonstrates a crucial principle: **constraint strength determines dynamics**
+- Hard constraints (-1e6): Rigid, stuck in local minima
+- Soft constraints (-10): Fluid, allows exploration and rearrangement
+- Real thermodynamic hardware could explore this balance at scale!
 
 ## How It Works
 
@@ -197,11 +189,14 @@ The model uses three types of factors plus a **distance-based potential field**:
 
 ### The "Water Flow" Effect
 
-The distance potential creates an energy landscape where:
-- Empty cells far from goal have low energy (neutral)
-- Active path cells close to goal have high energy (favorable)
-- This creates a natural gradient guiding the sampler toward the goal
-- Like water flowing downhill through channels!
+The **bidirectional distance potential** creates an energy landscape where:
+- Computes distances from **both** start and goal
+- Cells on the optimal path between them get maximum reward
+- Cells close to either endpoint also get bonuses
+- Creates a natural "corridor" from start to goal
+- Like water flowing through a channel from source to destination! 🌊
+
+This solves the key challenge: local sampling naturally follows the energy gradient from start, through the optimal corridor, to the goal.
 
 ### Sampling Strategy
 
