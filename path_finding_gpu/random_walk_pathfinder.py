@@ -71,6 +71,27 @@ def energy_to_color(exc):
     return COLOR_STOPS[-1][1]
 
 
+def diffuse_guide(u, src_pos, inject=1.0, evap=0.02, maze01=None, iters=1):
+    """Diffuse guide field from source through free space."""
+    u = u.clone()
+    H, W = u.shape
+
+    # 4-neighbor smoothing kernel
+    K = T.tensor([[0., 1., 0.],
+                  [1., 4., 1.],
+                  [0., 1., 0.]], device=u.device) / 8.0
+
+    for _ in range(iters):
+        u = u * (1.0 - evap)
+        # Convolve with padding
+        u_padded = T.nn.functional.pad(u[None, None], (1, 1, 1, 1), mode='constant', value=0.0)
+        u = T.nn.functional.conv2d(u_padded, K[None, None], padding=0).squeeze(0).squeeze(0)
+        u[src_pos] = u[src_pos] + inject  # Keep source bright
+        if maze01 is not None:
+            u[maze01 == 1] = 0.0  # Walls stay dark
+    return u
+
+
 def flood_fill_connected_with_distance(field, start_pos, threshold, H, W):
     """
     Find all cells connected to start_pos with energy > threshold.
@@ -135,9 +156,17 @@ def random_walk_pathfinder(
     # Bastion mask (1.0 where bastion trails exist, 0.0 for regular)
     bastion_mask = T.zeros((H, W), device=device)
 
+    # Guide fields: diffuse from start/goal through free space
+    S = T.zeros((H, W), device=device)  # guide from start
+    G = T.zeros((H, W), device=device)  # guide from goal
+
     # Active walkers
     walkers = []
     next_id = [0]  # Counter for walker IDs
+
+    # Best path tracking
+    best_path = None
+    best_len = None
 
     # Start and goal have energy for flood-fill, but we don't display it!
     field[start] = 1.0
@@ -146,6 +175,16 @@ def random_walk_pathfinder(
     bastion_mask[goal] = 1.0
 
     for t in range(steps):
+        # === UPDATE GUIDE FIELDS (diffuse through free space) ===
+        S = diffuse_guide(S, start, inject=1.0, evap=0.02, maze01=maze01, iters=1)
+        G = diffuse_guide(G, goal, inject=1.0, evap=0.02, maze01=maze01, iters=1)
+
+        # Synergy field lights up where the two waves overlap (the "corridor")
+        synergy = S * G
+
+        # Combined guidance: synergy + existing trails
+        combined = 0.7 * synergy + 0.3 * field
+
         # === SPAWN NEW WALKERS ===
 
         # 1. Bastion particles from terminals
@@ -203,72 +242,76 @@ def random_walk_pathfinder(
                 walker.alive = False
                 continue
 
-            # === DIRECTIONAL MOVEMENT (not random!) ===
+            # === GUIDANCE-BASED MOVEMENT ===
+            # Score neighbors by combined field + momentum + noise
 
-            # Determine preferred direction (away from tail)
-            if walker.direction is None or len(walker.trail) < 2:
-                # No momentum yet - pick random direction
-                neighbors = get_free_neighbors(walker.pos, maze01, H, W)
-                if not neighbors:
-                    walker.alive = False
-                    continue
-                next_pos = neighbors[T.randint(0, len(neighbors), (1,), generator=g).item()]
-                walker.direction = (next_pos[0] - walker.pos[0], next_pos[1] - walker.pos[1])
-            else:
-                # Has direction - prefer continuing forward
-                dr, dc = walker.direction
+            neighbors = get_free_neighbors(walker.pos, maze01, H, W)
+            if not neighbors:
+                walker.alive = False
+                continue
 
-                # Should we turn?
-                if T.rand(1, generator=g).item() < turn_chance:
-                    # Turn left or right
-                    if T.rand(1, generator=g).item() < 0.5:
-                        # Turn left: (dr,dc) → (-dc, dr)
-                        dr, dc = -dc, dr
-                    else:
-                        # Turn right: (dr,dc) → (dc, -dr)
-                        dr, dc = dc, -dr
+            # Score each neighbor
+            scores = []
+            dirs = []
+            for (nr, nc) in neighbors:
+                s = float(combined[nr, nc].item())
 
-                # Try to move in preferred direction
-                next_pos = (walker.pos[0] + dr, walker.pos[1] + dc)
+                # Momentum bonus (prefer continuing forward)
+                if walker.direction is not None:
+                    drp = nr - walker.pos[0]
+                    dcp = nc - walker.pos[1]
+                    if (drp, dcp) == walker.direction:
+                        s += 0.02  # momentum bonus
 
-                # Check if valid
-                if not (0 <= next_pos[0] < H and 0 <= next_pos[1] < W) or maze01[next_pos] == 1:
-                    # Hit wall - MUST turn
-                    # Try left
-                    dr_left, dc_left = -walker.direction[1], walker.direction[0]
-                    left_pos = (walker.pos[0] + dr_left, walker.pos[1] + dc_left)
+                # Exploration noise
+                s += T.rand(1, generator=g).item() * 0.005
 
-                    # Try right
-                    dr_right, dc_right = walker.direction[1], -walker.direction[0]
-                    right_pos = (walker.pos[0] + dr_right, walker.pos[1] + dc_right)
+                scores.append(s)
+                dirs.append((nr, nc))
 
-                    # Pick valid turn
-                    if (0 <= left_pos[0] < H and 0 <= left_pos[1] < W and maze01[left_pos] == 0
-                        and left_pos not in walker.trail):
-                        next_pos = left_pos
-                        dr, dc = dr_left, dc_left
-                    elif (0 <= right_pos[0] < H and 0 <= right_pos[1] < W and maze01[right_pos] == 0
-                          and right_pos not in walker.trail):
-                        next_pos = right_pos
-                        dr, dc = dr_right, dc_right
-                    else:
-                        # Can't turn, stuck
-                        walker.alive = False
-                        continue
+            # Pick argmax (crisper "snap" than stochastic sampling)
+            idx = int(T.tensor(scores).argmax().item())
+            next_pos = dirs[idx]
+            walker.direction = (next_pos[0] - walker.pos[0], next_pos[1] - walker.pos[1])
 
-                # Check if hitting own trail
-                if next_pos in walker.trail:
-                    walker.alive = False
-                    continue
-
-                # Update direction
-                walker.direction = (dr, dc)
+            # Check if hitting own trail
+            if next_pos in walker.trail:
+                walker.alive = False
+                continue
 
             # Check if position already occupied by another walker
             if next_pos in occupied_positions:
                 # Can't move there, skip this walker's move
                 new_walkers.append(walker)
                 continue
+
+            # === BRIDGE DETECTION ===
+            # Bridge: walker steps into cell where both guides are strong
+            bridge_here = (float(S[next_pos].item()) > 0.3) and (float(G[next_pos].item()) > 0.3)
+
+            if bridge_here:
+                # Form path: left side is walker's trail, right side follows G gradient to goal
+                left = list(walker.trail)
+                right = greedy_to_goal(next_pos, G, goal, maze01, H, W)
+                path = left + right
+
+                L = len(path)
+                if best_len is None or L < best_len - 2:
+                    # Upgrade: harden new path
+                    for pos in path:
+                        field[pos] = 1.0
+                        bastion_mask[pos] = 1.0  # Slower decay on backbone
+
+                    # Downgrade old backbone (except new path)
+                    if best_path is not None:
+                        old_set = set(best_path)
+                        new_set = set(path)
+                        for pos in old_set - new_set:
+                            if bastion_mask[pos] > 0.5:
+                                bastion_mask[pos] = 0.0
+
+                    best_path = path
+                    best_len = L
 
             # CHECK FOR COLLISION
             collision = False
@@ -343,10 +386,11 @@ def random_walk_pathfinder(
             if collision:
                 continue  # Don't add to new_walkers
 
-            # Move
+            # Move (additive deposition)
             walker.pos = next_pos
             walker.trail.append(next_pos)
-            field[next_pos] = walker.energy
+            deposit = 0.15 if walker.is_bastion else 0.08
+            field[next_pos] = T.minimum(field[next_pos] + deposit, T.tensor(1.0, device=device))
             if walker.is_bastion:
                 bastion_mask[next_pos] = 1.0
             occupied_positions.add(next_pos)  # Mark position as occupied
@@ -395,9 +439,12 @@ def random_walk_pathfinder(
             field[start] = T.maximum(field[start], T.tensor(0.9, device=device))
             field[goal] = T.maximum(field[goal], T.tensor(0.9, device=device))
 
+        # Check connectivity
+        connected = is_connected(field, start, goal, maze01, threshold=0.05)
+
         # Visualization
         if visualize_fn:
-            visualize_fn(t, field, walkers, is_pulse)
+            visualize_fn(t, field, walkers, is_pulse, connected, best_len)
 
     return None
 
@@ -412,6 +459,27 @@ def get_free_neighbors(pos, maze, H, W):
     return neighbors
 
 
+def greedy_to_goal(p, G, goal, maze01, H, W):
+    """Follow gradient of G to goal."""
+    path = [p]
+    visited = {p}
+    while p != goal:
+        best = None
+        bestv = -1.0
+        for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+            q = (p[0] + dr, p[1] + dc)
+            if 0 <= q[0] < H and 0 <= q[1] < W and maze01[q] == 0 and q not in visited:
+                v = float(G[q].item())
+                if v > bestv:
+                    bestv, best = v, q
+        if best is None:
+            break
+        p = best
+        path.append(p)
+        visited.add(p)
+    return path
+
+
 def find_tail_end(trail, field, threshold):
     """Find furthest position in trail above threshold energy."""
     for pos in reversed(trail):
@@ -420,7 +488,25 @@ def find_tail_end(trail, field, threshold):
     return None
 
 
-def render_terminal(t, field, walkers, maze01, start, goal, H, W, is_pulse_frame=False):
+def is_connected(field, start, goal, maze01, threshold=0.05):
+    """Check if start and goal are connected through field >= threshold."""
+    H, W = field.shape
+    seen = {start}
+    q = [start]
+    while q:
+        r, c = q.pop()
+        for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+            nr, nc = r + dr, c + dc
+            if 0 <= nr < H and 0 <= nc < W and (nr, nc) not in seen:
+                if maze01[nr, nc] == 0 and float(field[nr, nc].item()) >= threshold:
+                    if (nr, nc) == goal:
+                        return True
+                    seen.add((nr, nc))
+                    q.append((nr, nc))
+    return False
+
+
+def render_terminal(t, field, walkers, maze01, start, goal, H, W, is_pulse_frame=False, connected=False, best_len=None):
     """Render field with active walkers highlighted."""
 
     excitement = field.cpu().numpy()
@@ -465,7 +551,9 @@ def render_terminal(t, field, walkers, maze01, start, goal, H, W, is_pulse_frame
     total = float(excitement.sum())
     max_exc = float(excitement.max())
 
-    stats = f"Step {t:4d} | Walkers: {n_walkers:3d} | Trail Energy: {total:6.1f} | Max: {max_exc:.2f}"
+    conn_str = "[green]✓ CONNECTED[/green]" if connected else "[red]✗ disconnected[/red]"
+    len_str = f" | Best: {best_len}" if best_len is not None else ""
+    stats = f"Step {t:4d} | Walkers: {n_walkers:3d} | Trail Energy: {total:6.1f} | Max: {max_exc:.2f} | {conn_str}{len_str}"
 
     return Panel("\n".join(lines), subtitle=stats, border_style="bright_blue", expand=False)
 
@@ -537,8 +625,8 @@ def main():
     time.sleep(1)
 
     if args.debugger:
-        def viz(t, field, walkers, is_pulse):
-            panel = render_terminal(t, field, walkers, maze, start, goal, H, W, is_pulse)
+        def viz(t, field, walkers, is_pulse, connected, best_len):
+            panel = render_terminal(t, field, walkers, maze, start, goal, H, W, is_pulse, connected, best_len)
             console.clear()
             console.print(panel)
             wait_for_space(console)
@@ -571,8 +659,8 @@ def main():
         step_delay = 1.0 / args.fps
 
         with Live(console=console, refresh_per_second=30) as live:
-            def viz(t, field, walkers, is_pulse):
-                panel = render_terminal(t, field, walkers, maze, start, goal, H, W, is_pulse)
+            def viz(t, field, walkers, is_pulse, connected, best_len):
+                panel = render_terminal(t, field, walkers, maze, start, goal, H, W, is_pulse, connected, best_len)
                 live.update(panel)
                 time.sleep(step_delay)
 
