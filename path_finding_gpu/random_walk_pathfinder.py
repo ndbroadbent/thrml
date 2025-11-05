@@ -90,6 +90,9 @@ def random_walk_pathfinder(
     bastion_threshold=0.05,         # Min energy to connect to bastion trail (easier!)
     backprop_falloff=0.02,          # Energy decrease per cell distance (regular)
     bastion_backprop_falloff=0.01,  # Energy decrease per cell (bastion - spreads further!)
+    pulse_interval=20,              # Frames between terminal energy pulses (0 = disabled)
+    pulse_energy=0.8,               # Energy level for pulses (< 1.0 to avoid constant white)
+    pulse_falloff=0.01,             # Energy decrease per cell for pulses
     turn_chance=0.1,                # Probability to turn left/right instead of forward
     seed=0,
     visualize_fn=None,
@@ -113,7 +116,7 @@ def random_walk_pathfinder(
     walkers = []
     next_id = [0]  # Counter for walker IDs
 
-    # Initialize start and goal as permanent bastion sources
+    # Start and goal have energy for flood-fill, but we don't display it!
     field[start] = 1.0
     field[goal] = 1.0
     bastion_mask[start] = 1.0
@@ -341,13 +344,36 @@ def random_walk_pathfinder(
         for pos, energy in cells_to_flash:
             field[pos] = max(field[pos].item(), energy)
 
-        # Keep terminals alive
-        field[start] = T.maximum(field[start], T.tensor(0.8, device=device))
-        field[goal] = T.maximum(field[goal], T.tensor(0.8, device=device))
+        # === TERMINAL ENERGY PULSES ===
+        # Send periodic energy waves through connected networks to reinforce paths
+        is_pulse = pulse_interval > 0 and t % pulse_interval == 0
+        if is_pulse:
+            # Set terminals to 1.0 for pulse
+            field[start] = 1.0
+            field[goal] = 1.0
+
+            # Flood-fill from terminals through entire connected network
+            start_connected = flood_fill_connected_with_distance(
+                field, start, bastion_threshold, H, W
+            )
+            for pos, dist in start_connected.items():
+                pulse_e = max(pulse_energy - dist * pulse_falloff, bastion_threshold)
+                field[pos] = max(field[pos].item(), pulse_e)
+
+            goal_connected = flood_fill_connected_with_distance(
+                field, goal, bastion_threshold, H, W
+            )
+            for pos, dist in goal_connected.items():
+                pulse_e = max(pulse_energy - dist * pulse_falloff, bastion_threshold)
+                field[pos] = max(field[pos].item(), pulse_e)
+        else:
+            # Keep terminals at high energy (but not 1.0 so they don't flash)
+            field[start] = T.maximum(field[start], T.tensor(0.9, device=device))
+            field[goal] = T.maximum(field[goal], T.tensor(0.9, device=device))
 
         # Visualization
         if visualize_fn:
-            visualize_fn(t, field, walkers)
+            visualize_fn(t, field, walkers, is_pulse)
 
     return None
 
@@ -370,7 +396,7 @@ def find_tail_end(trail, field, threshold):
     return None
 
 
-def render_terminal(t, field, walkers, maze01, start, goal, H, W):
+def render_terminal(t, field, walkers, maze01, start, goal, H, W, is_pulse_frame=False):
     """Render field with active walkers highlighted."""
 
     excitement = field.cpu().numpy()
@@ -386,55 +412,61 @@ def render_terminal(t, field, walkers, maze01, start, goal, H, W):
     for i in range(H):
         row = ""
         for j in range(W):
+            exc = excitement[i, j]
+
             if (i, j) in active_pos:
                 # Active walker head - yellow
                 row += "[yellow]██[/yellow]"
-            elif (i, j) == start:
-                row += "[green]██[/green]"
-            elif (i, j) == goal:
-                row += "[red]██[/red]"
             elif maze01[i, j] == 1:
                 row += "░░"
-            else:
-                # Precise RGB gradient based on energy
-                exc = excitement[i, j]
-
-                if exc >= 1.0:
-                    # Maximum - bright white
+            elif (i, j) == start:
+                # Start terminal - flash white ONLY on pulse frames
+                if is_pulse_frame:
                     row += "[rgb(255,255,255)]██[/rgb(255,255,255)]"
-                elif exc >= 0.96:
-                    # Very high - bright cyan
-                    row += "[rgb(0,255,255)]██[/rgb(0,255,255)]"
-                elif exc >= 0.85:
-                    # High - cyan
-                    row += f"[rgb(0,{int(180 + (exc - 0.85) * 682)},{int(200 + (exc - 0.85) * 500)})]██[/rgb(0,{int(180 + (exc - 0.85) * 682)},{int(200 + (exc - 0.85) * 500)})]"
-                elif exc >= 0.6:
-                    # Medium-high - bright blue
-                    r = int((exc - 0.6) * 0 / 0.25)
-                    g = int(100 + (exc - 0.6) * 320)  # 100 → 180
-                    b = int(200 + (exc - 0.6) * 220)  # 200 → 255
-                    row += f"[rgb({r},{g},{b})]██[/rgb({r},{g},{b})]"
-                elif exc >= 0.3:
-                    # Medium - blue
-                    r = 0
-                    g = int(50 + (exc - 0.3) * 167)  # 50 → 100
-                    b = int(150 + (exc - 0.3) * 167)  # 150 → 200
-                    row += f"[rgb({r},{g},{b})]██[/rgb({r},{g},{b})]"
-                elif exc >= 0.1:
-                    # Low - dark blue
-                    r = 0
-                    g = int((exc - 0.1) * 250)  # 0 → 50
-                    b = int(80 + (exc - 0.1) * 350)  # 80 → 150
-                    row += f"[rgb({r},{g},{b})]██[/rgb({r},{g},{b})]"
-                elif exc >= 0.01:
-                    # Very low - very dark blue
-                    r = 0
-                    g = 0
-                    b = int(30 + (exc - 0.01) * 556)  # 30 → 80
-                    row += f"[rgb({r},{g},{b})]██[/rgb({r},{g},{b})]"
                 else:
-                    # No energy - deep dark blue (almost black)
-                    row += "[rgb(0,0,30)]██[/rgb(0,0,30)]"
+                    row += "[green]██[/green]"
+            elif (i, j) == goal:
+                # Goal terminal - flash white ONLY on pulse frames
+                if is_pulse_frame:
+                    row += "[rgb(255,255,255)]██[/rgb(255,255,255)]"
+                else:
+                    row += "[red]██[/red]"
+            elif exc >= 1.0:
+                # Maximum energy (collisions, etc) - bright white
+                row += "[rgb(255,255,255)]██[/rgb(255,255,255)]"
+            elif exc >= 0.96:
+                # Very high - bright cyan
+                row += "[rgb(0,255,255)]██[/rgb(0,255,255)]"
+            elif exc >= 0.85:
+                # High - cyan
+                row += f"[rgb(0,{int(180 + (exc - 0.85) * 682)},{int(200 + (exc - 0.85) * 500)})]██[/rgb(0,{int(180 + (exc - 0.85) * 682)},{int(200 + (exc - 0.85) * 500)})]"
+            elif exc >= 0.6:
+                # Medium-high - bright blue
+                r = int((exc - 0.6) * 0 / 0.25)
+                g = int(100 + (exc - 0.6) * 320)  # 100 → 180
+                b = int(200 + (exc - 0.6) * 220)  # 200 → 255
+                row += f"[rgb({r},{g},{b})]██[/rgb({r},{g},{b})]"
+            elif exc >= 0.3:
+                # Medium - blue
+                r = 0
+                g = int(50 + (exc - 0.3) * 167)  # 50 → 100
+                b = int(150 + (exc - 0.3) * 167)  # 150 → 200
+                row += f"[rgb({r},{g},{b})]██[/rgb({r},{g},{b})]"
+            elif exc >= 0.1:
+                # Low - dark blue
+                r = 0
+                g = int((exc - 0.1) * 250)  # 0 → 50
+                b = int(80 + (exc - 0.1) * 350)  # 80 → 150
+                row += f"[rgb({r},{g},{b})]██[/rgb({r},{g},{b})]"
+            elif exc >= 0.01:
+                # Very low - very dark blue
+                r = 0
+                g = 0
+                b = int(30 + (exc - 0.01) * 556)  # 30 → 80
+                row += f"[rgb({r},{g},{b})]██[/rgb({r},{g},{b})]"
+            else:
+                # No energy - deep dark blue (almost black)
+                row += "[rgb(0,0,30)]██[/rgb(0,0,30)]"
 
         lines.append(row)
 
@@ -465,6 +497,9 @@ def main():
     parser.add_argument('--bastion-threshold', type=float, default=0.05, help='Min energy to connect bastion (default: 0.05)')
     parser.add_argument('--backprop-falloff', type=float, default=0.02, help='Energy falloff per cell regular (default: 0.02)')
     parser.add_argument('--bastion-backprop-falloff', type=float, default=0.01, help='Energy falloff per cell bastion (default: 0.01)')
+    parser.add_argument('--pulse-interval', type=int, default=15, help='Frames between terminal pulses, 0=off (default: 15)')
+    parser.add_argument('--pulse-energy', type=float, default=0.8, help='Terminal pulse energy level (default: 0.8)')
+    parser.add_argument('--pulse-falloff', type=float, default=0.01, help='Terminal pulse falloff per cell (default: 0.01)')
     parser.add_argument('--turn-chance', type=float, default=0.1, help='Probability to turn instead of forward (default: 0.1)')
 
     parser.add_argument('--fps', type=int, default=60, help='Steps per second (default: 60)')
@@ -496,8 +531,8 @@ def main():
     time.sleep(1)
 
     if args.debugger:
-        def viz(t, field, walkers):
-            panel = render_terminal(t, field, walkers, maze, start, goal, H, W)
+        def viz(t, field, walkers, is_pulse):
+            panel = render_terminal(t, field, walkers, maze, start, goal, H, W, is_pulse)
             console.clear()
             console.print(panel)
             wait_for_space(console)
@@ -516,6 +551,9 @@ def main():
                 bastion_threshold=args.bastion_threshold,
                 backprop_falloff=args.backprop_falloff,
                 bastion_backprop_falloff=args.bastion_backprop_falloff,
+                pulse_interval=args.pulse_interval,
+                pulse_energy=args.pulse_energy,
+                pulse_falloff=args.pulse_falloff,
                 turn_chance=args.turn_chance,
                 seed=int(time.time()) % 1000,
                 visualize_fn=viz
@@ -526,8 +564,8 @@ def main():
         step_delay = 1.0 / args.fps
 
         with Live(console=console, refresh_per_second=30) as live:
-            def viz(t, field, walkers):
-                panel = render_terminal(t, field, walkers, maze, start, goal, H, W)
+            def viz(t, field, walkers, is_pulse):
+                panel = render_terminal(t, field, walkers, maze, start, goal, H, W, is_pulse)
                 live.update(panel)
                 time.sleep(step_delay)
 
@@ -545,6 +583,9 @@ def main():
                     bastion_threshold=args.bastion_threshold,
                     backprop_falloff=args.backprop_falloff,
                     bastion_backprop_falloff=args.bastion_backprop_falloff,
+                    pulse_interval=args.pulse_interval,
+                    pulse_energy=args.pulse_energy,
+                    pulse_falloff=args.pulse_falloff,
                     turn_chance=args.turn_chance,
                     seed=int(time.time()) % 1000,
                     visualize_fn=viz
