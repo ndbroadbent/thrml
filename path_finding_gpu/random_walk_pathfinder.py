@@ -39,13 +39,40 @@ def wait_for_space(console):
 
 class Walker:
     """Single random walker with position and trail."""
-    def __init__(self, pos, energy, particle_id):
+    def __init__(self, pos, energy, particle_id, is_bastion=False):
         self.pos = pos  # (row, col)
         self.energy = energy
         self.trail = [pos]  # History of positions
         self.alive = True
         self.id = particle_id
         self.direction = None  # Last direction moved (dr, dc)
+        self.is_bastion = is_bastion  # Spawned from terminal
+
+
+def flood_fill_connected_with_distance(field, start_pos, threshold, H, W):
+    """
+    Find all cells connected to start_pos with energy > threshold.
+    Returns dict: {pos: distance_from_start}
+    """
+    visited = set()
+    to_visit = [(start_pos, 0)]  # (position, distance)
+    connected = {}
+
+    while to_visit:
+        pos, dist = to_visit.pop(0)
+        if pos in visited:
+            continue
+        visited.add(pos)
+
+        if field[pos] > threshold:
+            connected[pos] = dist
+            # Check 4 neighbors
+            for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                nr, nc = pos[0] + dr, pos[1] + dc
+                if 0 <= nr < H and 0 <= nc < W and (nr, nc) not in visited:
+                    to_visit.append(((nr, nc), dist + 1))
+
+    return connected
 
 
 def random_walk_pathfinder(
@@ -53,12 +80,17 @@ def random_walk_pathfinder(
     start,
     goal,
     steps=2000,
-    bastion_rate=0.05,      # Probability per frame terminals emit walker
-    random_spawn_rate=0.0003,  # Random walkers appear
-    trail_decay=0.02,        # Trail decay per frame
-    particle_halflife=200,   # Steps before particle dies
-    backprop_threshold=0.1,  # Min energy to race back to
-    turn_chance=0.1,         # Probability to turn left/right instead of forward
+    bastion_rate=0.05,              # Probability per frame terminals emit walker
+    random_spawn_rate=0.0003,       # Random walkers appear
+    trail_decay=0.02,               # Trail decay per frame (regular trails)
+    bastion_decay=0.005,            # Trail decay for bastion trails (slower!)
+    particle_halflife=200,          # Steps before particle dies (regular)
+    bastion_halflife=600,           # Steps before bastion particle dies (longer!)
+    backprop_threshold=0.1,         # Min energy to connect to regular trail
+    bastion_threshold=0.05,         # Min energy to connect to bastion trail (easier!)
+    backprop_falloff=0.02,          # Energy decrease per cell distance (regular)
+    bastion_backprop_falloff=0.01,  # Energy decrease per cell (bastion - spreads further!)
+    turn_chance=0.1,                # Probability to turn left/right instead of forward
     seed=0,
     visualize_fn=None,
 ):
@@ -74,13 +106,18 @@ def random_walk_pathfinder(
     # Energy field (trails left by walkers)
     field = T.zeros((H, W), device=device)
 
+    # Bastion mask (1.0 where bastion trails exist, 0.0 for regular)
+    bastion_mask = T.zeros((H, W), device=device)
+
     # Active walkers
     walkers = []
     next_id = [0]  # Counter for walker IDs
 
-    # Initialize start and goal as permanent walkers (but they don't move)
+    # Initialize start and goal as permanent bastion sources
     field[start] = 1.0
     field[goal] = 1.0
+    bastion_mask[start] = 1.0
+    bastion_mask[goal] = 1.0
 
     for t in range(steps):
         # === SPAWN NEW WALKERS ===
@@ -91,18 +128,20 @@ def random_walk_pathfinder(
             neighbors = get_free_neighbors(start, maze01, H, W)
             if neighbors:
                 pos = neighbors[T.randint(0, len(neighbors), (1,), generator=g).item()]
-                walkers.append(Walker(pos, 1.0, next_id[0]))
+                walkers.append(Walker(pos, 1.0, next_id[0], is_bastion=True))
                 next_id[0] += 1
                 field[pos] = 1.0
+                bastion_mask[pos] = 1.0
 
         if T.rand(1, generator=g).item() < bastion_rate:
             # Spawn from goal
             neighbors = get_free_neighbors(goal, maze01, H, W)
             if neighbors:
                 pos = neighbors[T.randint(0, len(neighbors), (1,), generator=g).item()]
-                walkers.append(Walker(pos, 1.0, next_id[0]))
+                walkers.append(Walker(pos, 1.0, next_id[0], is_bastion=True))
                 next_id[0] += 1
                 field[pos] = 1.0
+                bastion_mask[pos] = 1.0
 
         # 2. Random ionization spawns
         if random_spawn_rate > 0:
@@ -121,6 +160,7 @@ def random_walk_pathfinder(
         connections_made = []
         collided_walkers = set()  # Track which walkers collided
         occupied_positions = set()  # Track current walker positions
+        cells_to_flash = []  # Collect cells to light up AFTER decay
 
         for walker in walkers:
             if not walker.alive:
@@ -130,9 +170,10 @@ def random_walk_pathfinder(
             if walker.id in collided_walkers:
                 continue
 
-            # Age walker
+            # Age walker (bastion walkers live longer!)
             walker.energy *= 0.997
-            if walker.energy < 0.1 or len(walker.trail) > particle_halflife:
+            max_age = bastion_halflife if walker.is_bastion else particle_halflife
+            if walker.energy < 0.1 or len(walker.trail) > max_age:
                 walker.alive = False
                 continue
 
@@ -204,39 +245,85 @@ def random_walk_pathfinder(
                 continue
 
             # CHECK FOR COLLISION
-            # 1. Head-to-head: stepping next to another active walker
-            # 2. Head-to-tail: stepping onto ANOTHER walker's trail (not own!)
+            # Hit ANY existing trail (not own) or another walker
             collision = False
-            collision_partner = None
 
-            # Check if stepping onto existing trail (but NOT own trail!)
-            if field[next_pos] > backprop_threshold and next_pos not in walker.trail:
-                # Hit another walker's trail!
-                for other in walkers:
-                    if other.alive and other.id != walker.id and next_pos in other.trail:
-                        collision = True
-                        collision_partner = other
-                        break
+            # Use appropriate threshold based on trail type
+            threshold = bastion_threshold if bastion_mask[next_pos] > 0.5 else backprop_threshold
+
+            # Check if stepping onto ANY trail (field energy > threshold, not own trail)
+            if field[next_pos] > threshold and next_pos not in walker.trail:
+                # Hit an existing trail!
+                collision = True
+
+                # First, add walker's trail to field
+                for pos in walker.trail:
+                    field[pos] = max(field[pos].item(), walker.energy)
+                    if walker.is_bastion:
+                        bastion_mask[pos] = 1.0
+                field[next_pos] = max(field[next_pos].item(), walker.energy)
+
+                # Now flood-fill to find ALL connected cells with distances
+                connected_with_dist = flood_fill_connected_with_distance(
+                    field, next_pos, threshold, H, W
+                )
+
+                # Collect cells to flash AFTER decay, with energy gradient
+                # Use bastion falloff if walker is bastion (spreads further!)
+                falloff = bastion_backprop_falloff if walker.is_bastion else backprop_falloff
+                for pos, dist in connected_with_dist.items():
+                    # Energy decreases with distance from collision
+                    energy = max(1.0 - dist * falloff, threshold)
+                    cells_to_flash.append((pos, energy))
+
+                collided_walkers.add(walker.id)
+                # Don't add to new_walkers - walker consumed by connection
+                continue
 
             # Check if adjacent to another active walker head
-            if not collision:
-                for other in walkers:
-                    if other.alive and other.id != walker.id and other.id not in collided_walkers:
-                        if abs(next_pos[0] - other.pos[0]) + abs(next_pos[1] - other.pos[1]) == 1:
-                            collision = True
-                            collision_partner = other
-                            break
+            for other in walkers:
+                if other.alive and other.id != walker.id and other.id not in collided_walkers:
+                    if abs(next_pos[0] - other.pos[0]) + abs(next_pos[1] - other.pos[1]) == 1:
+                        # Head-to-head collision
+                        collision = True
+                        collided_walkers.add(walker.id)
+                        collided_walkers.add(other.id)
 
-            if collision and collision_partner:
-                collided_walkers.add(walker.id)
-                collided_walkers.add(collision_partner.id)
-                connections_made.append((walker, collision_partner))
-                continue  # Handle collision later, don't add to new_walkers
+                        # Add both trails to field
+                        for pos in walker.trail:
+                            field[pos] = max(field[pos].item(), walker.energy)
+                            if walker.is_bastion:
+                                bastion_mask[pos] = 1.0
+                        for pos in other.trail:
+                            field[pos] = max(field[pos].item(), other.energy)
+                            if other.is_bastion:
+                                bastion_mask[pos] = 1.0
+
+                        # Use appropriate threshold
+                        thresh = bastion_threshold if (walker.is_bastion or other.is_bastion) else backprop_threshold
+
+                        # Flood fill from collision point to find ALL connected cells
+                        connected_with_dist = flood_fill_connected_with_distance(
+                            field, walker.pos, thresh, H, W
+                        )
+
+                        # Collect cells to flash AFTER decay, with energy gradient
+                        # Use bastion falloff if either walker is bastion (spreads further!)
+                        falloff = bastion_backprop_falloff if (walker.is_bastion or other.is_bastion) else backprop_falloff
+                        for pos, dist in connected_with_dist.items():
+                            energy = max(1.0 - dist * falloff, thresh)
+                            cells_to_flash.append((pos, energy))
+                        break
+
+            if collision:
+                continue  # Don't add to new_walkers
 
             # Move
             walker.pos = next_pos
             walker.trail.append(next_pos)
             field[next_pos] = walker.energy
+            if walker.is_bastion:
+                bastion_mask[next_pos] = 1.0
             occupied_positions.add(next_pos)  # Mark position as occupied
 
             new_walkers.append(walker)
@@ -245,21 +332,14 @@ def random_walk_pathfinder(
         walkers = new_walkers
 
         # === FIELD DECAY ===
-        field = field * (1.0 - trail_decay)
+        # Apply different decay rates for bastion vs regular trails
+        decay_rate = bastion_mask * bastion_decay + (1.0 - bastion_mask) * trail_decay
+        field = field * (1.0 - decay_rate)
         field = field.clamp(0, 1)
 
-        # === HANDLE COLLISIONS (BACKPROPAGATION!) ===
-        # Do this AFTER decay so the white flash is visible!
-
-        for walker1, walker2 in connections_made:
-            # Light up BOTH trails to 1.0!
-            for pos in walker1.trail:
-                field[pos] = 1.0
-            for pos in walker2.trail:
-                field[pos] = 1.0
-
-            # The lit-up trails will be visible this frame as white
-            # Next frame they'll decay like normal
+        # === FLASH CONNECTED NETWORKS (after decay!) ===
+        for pos, energy in cells_to_flash:
+            field[pos] = max(field[pos].item(), energy)
 
         # Keep terminals alive
         field[start] = T.maximum(field[start], T.tensor(0.8, device=device))
@@ -370,19 +450,24 @@ def render_terminal(t, field, walkers, maze01, start, goal, H, W):
 def main():
     parser = argparse.ArgumentParser(description="⚛️  Random Walk Pathfinder with Backpropagation")
 
-    parser.add_argument('--size', type=int, default=25, help='Maze size (default: 25)')
+    parser.add_argument('--size', type=int, default=42, help='Maze size (default: 42)')
     parser.add_argument('--obstacles', type=float, default=0.10, help='Obstacle density (default: 0.10)')
     parser.add_argument('--seed', type=int, default=42, help='Maze seed (default: 42)')
 
     parser.add_argument('--steps', type=int, default=2000, help='Simulation steps (default: 2000)')
     parser.add_argument('--bastion-rate', type=float, default=0.05, help='Terminal spawn rate per frame (default: 0.05)')
     parser.add_argument('--random-rate', type=float, default=0.0003, help='Random walker spawn rate (default: 0.0003)')
-    parser.add_argument('--decay', type=float, default=0.02, help='Trail decay rate (default: 0.02)')
-    parser.add_argument('--halflife', type=int, default=200, help='Particle lifetime steps (default: 200)')
-    parser.add_argument('--backprop-threshold', type=float, default=0.1, help='Min energy to race back to (default: 0.1)')
+    parser.add_argument('--decay', type=float, default=0.02, help='Trail decay rate regular (default: 0.02)')
+    parser.add_argument('--bastion-decay', type=float, default=0.005, help='Trail decay rate bastion (default: 0.005)')
+    parser.add_argument('--halflife', type=int, default=200, help='Particle lifetime steps regular (default: 200)')
+    parser.add_argument('--bastion-halflife', type=int, default=600, help='Particle lifetime steps bastion (default: 600)')
+    parser.add_argument('--backprop-threshold', type=float, default=0.1, help='Min energy to connect regular (default: 0.1)')
+    parser.add_argument('--bastion-threshold', type=float, default=0.05, help='Min energy to connect bastion (default: 0.05)')
+    parser.add_argument('--backprop-falloff', type=float, default=0.02, help='Energy falloff per cell regular (default: 0.02)')
+    parser.add_argument('--bastion-backprop-falloff', type=float, default=0.01, help='Energy falloff per cell bastion (default: 0.01)')
     parser.add_argument('--turn-chance', type=float, default=0.1, help='Probability to turn instead of forward (default: 0.1)')
 
-    parser.add_argument('--fps', type=int, default=10, help='Steps per second (default: 10)')
+    parser.add_argument('--fps', type=int, default=60, help='Steps per second (default: 60)')
     parser.add_argument('--debugger', action='store_true', help='Step-through mode (SPACE to advance)')
 
     args = parser.parse_args()
@@ -424,8 +509,13 @@ def main():
                 bastion_rate=args.bastion_rate,
                 random_spawn_rate=args.random_rate,
                 trail_decay=args.decay,
+                bastion_decay=args.bastion_decay,
                 particle_halflife=args.halflife,
+                bastion_halflife=args.bastion_halflife,
                 backprop_threshold=args.backprop_threshold,
+                bastion_threshold=args.bastion_threshold,
+                backprop_falloff=args.backprop_falloff,
+                bastion_backprop_falloff=args.bastion_backprop_falloff,
                 turn_chance=args.turn_chance,
                 seed=int(time.time()) % 1000,
                 visualize_fn=viz
@@ -448,8 +538,13 @@ def main():
                     bastion_rate=args.bastion_rate,
                     random_spawn_rate=args.random_rate,
                     trail_decay=args.decay,
+                    bastion_decay=args.bastion_decay,
                     particle_halflife=args.halflife,
+                    bastion_halflife=args.bastion_halflife,
                     backprop_threshold=args.backprop_threshold,
+                    bastion_threshold=args.bastion_threshold,
+                    backprop_falloff=args.backprop_falloff,
+                    bastion_backprop_falloff=args.bastion_backprop_falloff,
                     turn_chance=args.turn_chance,
                     seed=int(time.time()) % 1000,
                     visualize_fn=viz
