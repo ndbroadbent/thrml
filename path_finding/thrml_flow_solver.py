@@ -9,6 +9,7 @@ shortest paths under 4-neighbour connectivity.
 from __future__ import annotations
 
 from collections import deque
+from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import jax
@@ -19,6 +20,13 @@ from thrml.block_sampling import BlockGibbsSpec, SamplingSchedule, sample_states
 from thrml.factor import FactorSamplingProgram
 from thrml.models.discrete_ebm import CategoricalEBMFactor, CategoricalGibbsConditional
 from thrml.pgm import CategoricalNode
+
+try:  # pragma: no cover - optional dependency guard
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import LinearSegmentedColormap
+except Exception:  # pragma: no cover - fallback when matplotlib unavailable
+    plt = None
+    LinearSegmentedColormap = None
 
 
 GridCoord = Tuple[int, int]
@@ -332,6 +340,151 @@ def _shortest_path_bfs(maze: np.ndarray, start: GridCoord, goal: GridCoord) -> O
     return path
 
 
+def _edge_activation_statistics(
+    stacked: np.ndarray,
+    dir_edges: List[DirectedEdge],
+    height: int,
+    width: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Aggregate edge activation probabilities and project them onto cells."""
+
+    if stacked.size == 0:
+        return np.zeros(len(dir_edges), dtype=np.float32), np.zeros((height, width), dtype=np.float32)
+
+    edge_probs = stacked.mean(axis=(0, 1))
+    cell_heat = np.zeros((height, width), dtype=np.float32)
+
+    for prob, (u, v) in zip(edge_probs, dir_edges):
+        cell_heat[u] += prob
+        cell_heat[v] += prob
+
+    max_val = float(cell_heat.max(initial=0.0))
+    if max_val > 0:
+        cell_heat = cell_heat / max_val
+
+    return edge_probs.astype(np.float32), cell_heat.astype(np.float32)
+
+
+def _ensure_matplotlib_ready() -> None:
+    if plt is None or LinearSegmentedColormap is None:  # pragma: no cover - runtime guard
+        raise RuntimeError(
+            "matplotlib is required for PNG output but is not available. "
+            "Install matplotlib or use render_flow_path_ascii instead."
+        )
+
+
+def render_flow_path_ascii(
+    maze: np.ndarray,
+    path: Optional[Sequence[GridCoord]],
+    *,
+    start: Optional[GridCoord] = None,
+    goal: Optional[GridCoord] = None,
+    background: str = ".",
+    path_char: str = "*",
+    wall_char: str = "#",
+) -> str:
+    """Render an ASCII depiction of the maze with an optional path overlay."""
+
+    maze = np.asarray(maze, dtype=np.uint8)
+    height, width = maze.shape
+
+    grid = np.full((height, width), background, dtype="U1")
+    grid[maze == 1] = wall_char
+
+    if path:
+        for coord in path:
+            if maze[coord] == 0:
+                grid[coord] = path_char
+
+    if start is None and path:
+        start = path[0]
+    if goal is None and path:
+        goal = path[-1]
+
+    if start is not None:
+        grid[start] = "S"
+    if goal is not None:
+        grid[goal] = "G"
+
+    return "\n".join("".join(grid[r]) for r in range(height))
+
+
+def _default_cmap() -> LinearSegmentedColormap:
+    _ensure_matplotlib_ready()
+    colors = [
+        (0.05, 0.05, 0.18),
+        (0.1, 0.3, 0.6),
+        (0.2, 0.7, 0.65),
+        (0.85, 0.9, 0.25),
+        (1.0, 0.6, 0.05),
+    ]
+    return LinearSegmentedColormap.from_list("thrml_flow", colors)
+
+
+def save_flow_path_png(
+    maze: np.ndarray,
+    path: Optional[Sequence[GridCoord]],
+    *,
+    start: Optional[GridCoord] = None,
+    goal: Optional[GridCoord] = None,
+    outfile: str | Path = "thrml_flow.png",
+    cell_heat: Optional[np.ndarray] = None,
+    edge_probs: Optional[np.ndarray] = None,
+    dir_edges: Optional[List[DirectedEdge]] = None,
+    dpi: int = 160,
+) -> Path:
+    """Save a PNG visualizing the maze, sampling heatmap, and decoded path."""
+
+    _ensure_matplotlib_ready()
+
+    maze = np.asarray(maze, dtype=np.uint8)
+    height, width = maze.shape
+
+    outfile = Path(outfile)
+    outfile.parent.mkdir(parents=True, exist_ok=True)
+
+    cmap = _default_cmap()
+    base = np.ones((height, width), dtype=np.float32) * 0.1
+    base[maze == 1] = -0.25
+
+    if cell_heat is None:
+        heat = np.zeros_like(base)
+    else:
+        heat = np.clip(cell_heat, 0.0, 1.0)
+
+    overlay = np.clip(base + heat, -0.25, 1.0)
+
+    fig, ax = plt.subplots(figsize=(width / 6.0, height / 6.0), dpi=dpi)
+    ax.imshow(overlay, cmap=cmap, interpolation="nearest")
+    ax.set_axis_off()
+
+    if path:
+        ys = [coord[0] for coord in path]
+        xs = [coord[1] for coord in path]
+        ax.plot(xs, ys, color="white", linewidth=2.2, alpha=0.95)
+        ax.scatter(xs[0], ys[0], c="lime", s=80, edgecolors="black", zorder=5)
+        ax.scatter(xs[-1], ys[-1], c="red", s=80, edgecolors="black", zorder=5)
+
+    if edge_probs is not None and dir_edges is not None:
+        for prob, (u, v) in zip(edge_probs, dir_edges):
+            if prob <= 0.02:
+                continue
+            ux, uy = u[1], u[0]
+            vx, vy = v[1], v[0]
+            ax.plot(
+                [ux, vx],
+                [uy, vy],
+                color=(1.0, 1.0, 1.0, min(0.75, 0.2 + float(prob) * 0.9)),
+                linewidth=1.0,
+            )
+
+    fig.tight_layout(pad=0)
+    fig.savefig(outfile, bbox_inches="tight", pad_inches=0)
+    plt.close(fig)
+
+    return outfile
+
+
 def solve_maze_flow(
     maze: np.ndarray,
     *,
@@ -345,7 +498,7 @@ def solve_maze_flow(
     warmup: int = 400,
     samples: int = 16,
     steps_per_sample: int = 8,
-    seed: int = 0,
+    seed: int = 123,
     fallback_to_shortest: bool = True,
 ) -> Tuple[Optional[List[GridCoord]], Dict[str, object]]:
     """Sample from the flow-based energy model and decode a path.
@@ -410,7 +563,14 @@ def solve_maze_flow(
     )
 
     stacked = sample_fn(init_states, keys)[0]
-    final_states = np.array(stacked[:, -1, :])
+    stacked_np = np.array(stacked)
+    final_states = stacked_np[:, -1, :]
+
+    edge_probs, cell_heat = _edge_activation_statistics(
+        stacked_np, meta["dir_edges"], maze.shape[0], maze.shape[1]
+    )
+    meta["edge_marginals"] = edge_probs
+    meta["cell_heat"] = cell_heat
 
     best_path: Optional[List[GridCoord]] = None
     best_len = float("inf")
@@ -422,12 +582,15 @@ def solve_maze_flow(
             best_len = len(path)
 
     if best_path is not None:
+        meta["best_path"] = best_path
         return best_path, meta
 
     if fallback_to_shortest:
         fallback = _shortest_path_bfs(maze, start, goal)
+        meta["best_path"] = fallback
         return fallback, meta
 
+    meta["best_path"] = None
     return None, meta
 
 
@@ -435,8 +598,81 @@ __all__ = [
     "N_STATES",
     "auto_start_goal",
     "build_flow_thrml_program",
+    "render_flow_path_ascii",
+    "save_flow_path_png",
     "decode_flow_path",
     "solve_maze_flow",
+    "demo",
 ]
 
+
+def demo(
+    size: int = 42,
+    obstacle_rate: float = 0.18,
+    output_png: str | Path = "thrml_flow_demo.png",
+    chains: int = 96,
+    warmup: int = 500,
+    samples: int = 24,
+    seed: int = 48,
+) -> Tuple[Optional[List[GridCoord]], Dict[str, object]]:
+    """Run a sampling demo, print ASCII output, and save a PNG visualisation."""
+
+    rng = np.random.default_rng(seed)
+    maze = np.zeros((size, size), dtype=np.uint8)
+    mask = rng.random((size, size)) < obstacle_rate
+    mask[0, :] = mask[-1, :] = mask[:, 0] = mask[:, -1] = False
+    maze[mask] = 1
+
+    # Add a horizontal barrier spanning the full width to avoid trivial perimeter paths.
+    if size >= 12:
+        mid_row = size // 2
+        maze[mid_row, :] = 1
+        gap_cols = {
+            max(1, size // 4),
+            min(size - 2, (3 * size) // 4),
+        }
+        for gc in gap_cols:
+            maze[mid_row, gc] = 0
+
+    path, meta = solve_maze_flow(
+        maze,
+        lam=1.0,
+        rho_cons=12.0,
+        rho_anti=12.0,
+        beta=9.0,
+        n_chains=chains,
+        warmup=warmup,
+        samples=samples,
+        steps_per_sample=8,
+        seed=seed,
+        fallback_to_shortest=True,
+    )
+
+    # Ensure start/goal remain open in case the barrier overlapped them.
+    maze[meta["start"]] = 0
+    maze[meta["goal"]] = 0
+
+    ascii_art = render_flow_path_ascii(maze, path, start=meta["start"], goal=meta["goal"])
+    print(ascii_art)
+
+    try:
+        save_flow_path_png(
+            maze,
+            path,
+            start=meta["start"],
+            goal=meta["goal"],
+            outfile=output_png,
+            cell_heat=meta.get("cell_heat"),
+            edge_probs=meta.get("edge_marginals"),
+            dir_edges=meta.get("dir_edges"),
+        )
+        print(f"Saved visualisation to {output_png}")
+    except RuntimeError as exc:
+        print(f"Skipping PNG generation: {exc}")
+
+    return path, meta
+
+
+if __name__ == "__main__":  # pragma: no cover - manual entrypoint
+    demo()
 

@@ -2,6 +2,14 @@
 
 import numpy as np
 
+from path_finding.thrml_flow_solver import (
+    build_flow_thrml_program,
+    decode_flow_path,
+    render_flow_path_ascii,
+    save_flow_path_png,
+    solve_maze_flow,
+)
+
 
 def _simple_flow_vector(var_idx, edges_on):
     """Utility to build a binary flow vector with given active edges."""
@@ -14,8 +22,6 @@ def _simple_flow_vector(var_idx, edges_on):
 
 def test_build_flow_program_counts():
     """Basic sanity checks on the flow program structure."""
-
-    from path_finding.thrml_flow_solver import build_flow_thrml_program
 
     maze = np.zeros((2, 2), dtype=np.uint8)
     start = (0, 0)
@@ -49,8 +55,6 @@ def test_build_flow_program_counts():
 
 def test_decode_flow_path_simple():
     """Decoding should recover a simple path from active flows."""
-
-    from path_finding.thrml_flow_solver import build_flow_thrml_program, decode_flow_path
 
     maze = np.zeros((2, 2), dtype=np.uint8)
     start = (0, 0)
@@ -87,8 +91,6 @@ def test_decode_flow_path_simple():
 def test_solve_maze_flow_simple():
     """Solver should find a Manhattan path on an open grid."""
 
-    from path_finding.thrml_flow_solver import solve_maze_flow
-
     maze = np.zeros((4, 4), dtype=np.uint8)
     start = (0, 0)
     goal = (3, 3)
@@ -118,5 +120,43 @@ def test_solve_maze_flow_simple():
     for (r1, c1), (r2, c2) in zip(path, path[1:]):
         assert maze[r2, c2] == 0
         assert abs(r1 - r2) + abs(c1 - c2) == 1
+
+
+def test_render_flow_path_ascii(tmp_path):
+    """ASCII renderer should highlight walls, start/goal, and the path."""
+
+    maze = np.zeros((3, 4), dtype=np.uint8)
+    maze[1, 2] = 1  # a wall
+
+    path = [(0, 0), (0, 1), (0, 2), (0, 3), (1, 3), (2, 3)]
+    ascii_art = render_flow_path_ascii(maze, path, start=(0, 0), goal=(2, 3))
+
+    lines = ascii_art.strip().splitlines()
+    # Ensure grid dimensions
+    assert len(lines) == 3
+    assert all(len(line) == 4 for line in lines)
+
+    assert lines[0][0] == "S"  # start
+    assert lines[2][3] == "G"  # goal
+    assert lines[1][2] == "#"  # wall
+    assert "*" in ascii_art  # path markers
+
+    # round-trip: write to file so manual demo can read it later
+    ascii_file = tmp_path / "maze.txt"
+    ascii_file.write_text(ascii_art)
+    assert ascii_file.read_text() == ascii_art
+
+
+def test_save_flow_path_png(tmp_path):
+    """PNG renderer should create an image without errors."""
+
+    maze = np.zeros((4, 4), dtype=np.uint8)
+    path = [(0, 0), (0, 1), (1, 1), (2, 1), (3, 1), (3, 2), (3, 3)]
+
+    outfile = tmp_path / "flow.png"
+    save_flow_path_png(maze, path, start=(0, 0), goal=(3, 3), outfile=outfile)
+
+    assert outfile.exists()
+    assert outfile.stat().st_size > 0
 
 
