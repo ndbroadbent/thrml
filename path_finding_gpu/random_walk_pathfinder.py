@@ -276,45 +276,39 @@ def random_walk_pathfinder(
             # Use appropriate threshold based on trail type
             threshold = bastion_threshold if bastion_mask[next_pos] > 0.5 else backprop_threshold
             current_exc = float(field[walker.pos].item())
-            allow_pass_through = (not kill_on_collision) and current_exc >= threshold
+            entering_high = field[next_pos] > threshold and current_exc <= threshold
+            in_high_region = field[next_pos] > threshold and current_exc > threshold
 
             # Check if stepping onto ANY trail (field energy > threshold, not own trail)
             if field[next_pos] > threshold and next_pos not in walker.trail:
-                if allow_pass_through:
-                    pass  # Keep walking through high-energy region
-                else:
-                    # Hit an existing trail!
-                    # First, add walker's trail to field
+                if kill_on_collision or entering_high:
+                    # Trigger collision effect (bridge two regions)
                     for pos in walker.trail:
                         field[pos] = max(field[pos].item(), walker.energy)
                         if walker.is_bastion:
                             bastion_mask[pos] = 1.0
                     field[next_pos] = max(field[next_pos].item(), walker.energy)
 
-                    # Now flood-fill to find ALL connected cells with distances
                     connected_with_dist = flood_fill_connected_with_distance(
                         field, next_pos, threshold, H, W
                     )
 
-                    # Collect cells to flash AFTER decay, with energy gradient
-                    # Use bastion falloff if walker is bastion (spreads further!)
                     falloff = bastion_backprop_falloff if walker.is_bastion else backprop_falloff
                     for pos, dist in connected_with_dist.items():
-                        # Energy decreases with distance from collision
                         energy = max(1.0 - dist * falloff, threshold)
                         cells_to_flash.append((pos, energy))
 
                     if kill_on_collision:
                         collided_walkers.add(walker.id)
                         continue
+                elif in_high_region:
+                    # Already inside energized network -> glide through
+                    pass
 
             # Check if adjacent to another active walker head
             for other in walkers:
                 if other.alive and other.id != walker.id and other.id not in collided_walkers:
                     if abs(next_pos[0] - other.pos[0]) + abs(next_pos[1] - other.pos[1]) == 1:
-                        if allow_pass_through:
-                            continue
-
                         collision = kill_on_collision
                         if kill_on_collision:
                             collided_walkers.add(walker.id)
