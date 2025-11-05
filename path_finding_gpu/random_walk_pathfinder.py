@@ -45,6 +45,7 @@ class Walker:
         self.trail = [pos]  # History of positions
         self.alive = True
         self.id = particle_id
+        self.direction = None  # Last direction moved (dr, dc)
 
 
 def random_walk_pathfinder(
@@ -57,6 +58,7 @@ def random_walk_pathfinder(
     trail_decay=0.02,        # Trail decay per frame
     particle_halflife=200,   # Steps before particle dies
     backprop_threshold=0.1,  # Min energy to race back to
+    turn_chance=0.1,         # Probability to turn left/right instead of forward
     seed=0,
     visualize_fn=None,
 ):
@@ -134,25 +136,66 @@ def random_walk_pathfinder(
                 walker.alive = False
                 continue
 
-            # Find valid moves (free neighbors with low energy)
-            neighbors = get_free_neighbors(walker.pos, maze01, H, W)
+            # === DIRECTIONAL MOVEMENT (not random!) ===
 
-            # Prefer low-energy neighbors (exploration, not retracing)
-            valid = []
-            for n in neighbors:
-                if field[n] < 0.5:  # Don't walk on already-strong trails
-                    valid.append(n)
+            # Determine preferred direction (away from tail)
+            if walker.direction is None or len(walker.trail) < 2:
+                # No momentum yet - pick random direction
+                neighbors = get_free_neighbors(walker.pos, maze01, H, W)
+                if not neighbors:
+                    walker.alive = False
+                    continue
+                next_pos = neighbors[T.randint(0, len(neighbors), (1,), generator=g).item()]
+                walker.direction = (next_pos[0] - walker.pos[0], next_pos[1] - walker.pos[1])
+            else:
+                # Has direction - prefer continuing forward
+                dr, dc = walker.direction
 
-            if not valid:
-                # Stuck - try any neighbor
-                valid = neighbors
+                # Should we turn?
+                if T.rand(1, generator=g).item() < turn_chance:
+                    # Turn left or right
+                    if T.rand(1, generator=g).item() < 0.5:
+                        # Turn left: (dr,dc) → (-dc, dr)
+                        dr, dc = -dc, dr
+                    else:
+                        # Turn right: (dr,dc) → (dc, -dr)
+                        dr, dc = dc, -dr
 
-            if not valid:
-                walker.alive = False
-                continue
+                # Try to move in preferred direction
+                next_pos = (walker.pos[0] + dr, walker.pos[1] + dc)
 
-            # Random step
-            next_pos = valid[T.randint(0, len(valid), (1,), generator=g).item()]
+                # Check if valid
+                if not (0 <= next_pos[0] < H and 0 <= next_pos[1] < W) or maze01[next_pos] == 1:
+                    # Hit wall - MUST turn
+                    # Try left
+                    dr_left, dc_left = -walker.direction[1], walker.direction[0]
+                    left_pos = (walker.pos[0] + dr_left, walker.pos[1] + dc_left)
+
+                    # Try right
+                    dr_right, dc_right = walker.direction[1], -walker.direction[0]
+                    right_pos = (walker.pos[0] + dr_right, walker.pos[1] + dc_right)
+
+                    # Pick valid turn
+                    if (0 <= left_pos[0] < H and 0 <= left_pos[1] < W and maze01[left_pos] == 0
+                        and left_pos not in walker.trail):
+                        next_pos = left_pos
+                        dr, dc = dr_left, dc_left
+                    elif (0 <= right_pos[0] < H and 0 <= right_pos[1] < W and maze01[right_pos] == 0
+                          and right_pos not in walker.trail):
+                        next_pos = right_pos
+                        dr, dc = dr_right, dc_right
+                    else:
+                        # Can't turn, stuck
+                        walker.alive = False
+                        continue
+
+                # Check if hitting own trail
+                if next_pos in walker.trail:
+                    walker.alive = False
+                    continue
+
+                # Update direction
+                walker.direction = (dr, dc)
 
             # Check if position already occupied by another walker
             if next_pos in occupied_positions:
@@ -337,6 +380,7 @@ def main():
     parser.add_argument('--decay', type=float, default=0.02, help='Trail decay rate (default: 0.02)')
     parser.add_argument('--halflife', type=int, default=200, help='Particle lifetime steps (default: 200)')
     parser.add_argument('--backprop-threshold', type=float, default=0.1, help='Min energy to race back to (default: 0.1)')
+    parser.add_argument('--turn-chance', type=float, default=0.1, help='Probability to turn instead of forward (default: 0.1)')
 
     parser.add_argument('--fps', type=int, default=10, help='Steps per second (default: 10)')
     parser.add_argument('--debugger', action='store_true', help='Step-through mode (SPACE to advance)')
@@ -360,9 +404,9 @@ def main():
     maze[goal] = 0
 
     console.print(f"Maze: {H}×{W} | Obstacles: {int(maze.sum())}")
-    console.print(f"Bastion: {args.bastion_rate} | Random: {args.random_rate} | Decay: {args.decay}")
-    console.print(f"Halflife: {args.halflife} | Backprop threshold: {args.backprop_threshold}\n")
-    console.print("[dim]Legend: [/dim][magenta]██[/magenta][dim]=active walker | Trails fade from white→blue→dark[/dim]\n")
+    console.print(f"Bastion: {args.bastion_rate} | Random: {args.random_rate} | Turn: {args.turn_chance}")
+    console.print(f"Decay: {args.decay} | Halflife: {args.halflife} | Backprop: {args.backprop_threshold}\n")
+    console.print("[dim]Legend: [/dim][yellow]██[/yellow][dim]=walker head | Trails: [/dim][rgb(255,255,255)]██[/rgb(255,255,255)][dim]→[/dim][rgb(0,255,255)]██[/rgb(0,255,255)][dim]→blue→dark[/dim]\n")
 
     time.sleep(1)
 
@@ -382,6 +426,7 @@ def main():
                 trail_decay=args.decay,
                 particle_halflife=args.halflife,
                 backprop_threshold=args.backprop_threshold,
+                turn_chance=args.turn_chance,
                 seed=int(time.time()) % 1000,
                 visualize_fn=viz
             )
@@ -405,6 +450,7 @@ def main():
                     trail_decay=args.decay,
                     particle_halflife=args.halflife,
                     backprop_threshold=args.backprop_threshold,
+                    turn_chance=args.turn_chance,
                     seed=int(time.time()) % 1000,
                     visualize_fn=viz
                 )
