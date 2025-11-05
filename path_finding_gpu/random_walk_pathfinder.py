@@ -526,7 +526,22 @@ def main():
     console.print(f"Maze: {H}×{W} | Obstacles: {int(maze.sum())}")
     console.print(f"Bastion: {args.bastion_rate} | Random: {args.random_rate} | Turn: {args.turn_chance}")
     console.print(f"Decay: {args.decay} | Halflife: {args.halflife} | Backprop: {args.backprop_threshold}\n")
-    console.print("[dim]Legend: [/dim][yellow]██[/yellow][dim]=walker head | Trails: [/dim][rgb(255,255,255)]██[/rgb(255,255,255)][dim]→[/dim][rgb(0,255,255)]██[/rgb(0,255,255)][dim]→blue→dark[/dim]\n")
+
+    # Energy scale legend
+    console.print("[bold]Energy Scale:[/bold]")
+    console.print("[dim]1.0=[/dim][rgb(255,255,255)]██[/rgb(255,255,255)] "
+                  "[dim]0.96=[/dim][rgb(0,255,255)]██[/rgb(0,255,255)] "
+                  "[dim]0.9=[/dim][rgb(0,200,230)]██[/rgb(0,200,230)] "
+                  "[dim]0.85=[/dim][rgb(0,180,200)]██[/rgb(0,180,200)] "
+                  "[dim]0.7=[/dim][rgb(0,140,230)]██[/rgb(0,140,230)]")
+    console.print("[dim]0.6=[/dim][rgb(0,100,200)]██[/rgb(0,100,200)] "
+                  "[dim]0.45=[/dim][rgb(0,75,175)]██[/rgb(0,75,175)] "
+                  "[dim]0.3=[/dim][rgb(0,50,150)]██[/rgb(0,50,150)] "
+                  "[dim]0.2=[/dim][rgb(0,30,120)]██[/rgb(0,30,120)] "
+                  "[dim]0.1=[/dim][rgb(0,10,80)]██[/rgb(0,10,80)] "
+                  "[dim]0.05=[/dim][rgb(0,0,55)]██[/rgb(0,0,55)] "
+                  "[dim]0.0=[/dim][rgb(0,0,30)]██[/rgb(0,0,30)]")
+    console.print("[dim]Special: [/dim][yellow]██[/yellow][dim]=walker | [/dim][green]██[/green][dim]=start | [/dim][red]██[/red][dim]=goal | [/dim]░░[dim]=wall[/dim]\n")
 
     time.sleep(1)
 
