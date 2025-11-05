@@ -58,9 +58,10 @@ class ParticleSwarm:
         self.particles = T.zeros((max_particles, 4), device=device)
         self.active = T.zeros(max_particles, dtype=T.bool, device=device)
         self.lifetime = T.zeros(max_particles, device=device)
+        self.deposit_amount = T.zeros(max_particles, device=device)  # Energy each particle deposits
 
-    def spawn(self, positions, velocities, lifetimes):
-        """Spawn particles at positions with given velocities."""
+    def spawn(self, positions, velocities, lifetimes, deposits):
+        """Spawn particles at positions with given velocities and deposit amounts."""
         n = len(positions)
         if n == 0:
             return
@@ -74,8 +75,9 @@ class ParticleSwarm:
         self.particles[slots, 2:] = velocities[:n]  # vx, vy
         self.active[slots] = True
         self.lifetime[slots] = lifetimes[:n]
+        self.deposit_amount[slots] = deposits[:n]
 
-    def update(self, maze, field, deposit):
+    def update(self, maze, field):
         """Move particles, deposit energy, check collisions."""
         if not self.active.any():
             return
@@ -90,10 +92,11 @@ class ParticleSwarm:
         px = self.particles[active_idx, 0].long().clamp(0, self.W - 1)
         py = self.particles[active_idx, 1].long().clamp(0, self.H - 1)
 
-        # Deposit energy in field
+        # Deposit energy in field (using per-particle deposit amount!)
         for i, (y, x) in enumerate(zip(py, px)):
             if maze[y, x] == 0:  # Not a wall
-                field[0, 0, y, x] += deposit * self.lifetime[active_idx[i]]
+                # Deposit based on particle's energy AND lifetime
+                field[0, 0, y, x] += self.deposit_amount[active_idx[i]] * self.lifetime[active_idx[i]]
 
         # Check walls - stop particles immediately
         hit_wall = maze[py, px] == 1
@@ -115,7 +118,7 @@ def hybrid_pathfinder(
     ionization_rate=0.0005,  # Random ionization events
     terminal_emit=3,         # Particles from start/goal per frame
     speed_range=(0.2, 0.8),  # Particle speed
-    deposit=0.25,            # Energy deposited by particles
+    deposit_range=(0.1, 0.4), # Energy deposited by particles (min, max)
     alpha=0.15,              # Field decay
     kappa=3.0,               # Reinforcement from neighbors
     gamma=0.05,              # Field spreading
@@ -161,34 +164,47 @@ def hybrid_pathfinder(
                 positions = T.stack([ion_pos[:, 1].float(), ion_pos[:, 0].float()], dim=1)  # x, y
                 velocities = T.stack([T.cos(angles) * speeds, T.sin(angles) * speeds], dim=1)
                 lifetimes = T.ones(n, device=device)
+                # Random deposit amounts
+                deposits = deposit_range[0] + T.rand(n, generator=g, device=device) * (deposit_range[1] - deposit_range[0])
 
-                swarm.spawn(positions, velocities, lifetimes)
+                swarm.spawn(positions, velocities, lifetimes, deposits)
 
-        # 2. Terminals emit particles toward excited neighbors
+        # 2. Terminals emit particles TOWARD each other (directional, not spray)
         excited = (x > theta).float()
 
-        # Emit from start
+        # Direction from start to goal
+        dx_to_goal = goal[1] - start[1]
+        dy_to_goal = goal[0] - start[0]
+        angle_to_goal = T.atan2(T.tensor(dy_to_goal, dtype=T.float32), T.tensor(dx_to_goal, dtype=T.float32)).item()
+
+        # Emit from start (biased toward goal with some randomness)
         for _ in range(terminal_emit):
-            angle = T.rand(1, generator=g, device=device).item() * 2 * 3.14159
+            # Random angle centered on direction to goal, with ±60° spread
+            spread = (T.rand(1, generator=g, device=device).item() - 0.5) * 2.1  # ±60° ≈ 1.05 rad
+            angle = angle_to_goal + spread
             speed = speed_range[0] + T.rand(1, generator=g, device=device).item() * (speed_range[1] - speed_range[0])
 
             pos = T.tensor([[start[1], start[0]]], dtype=T.float32, device=device)
             vel = T.tensor([[T.cos(T.tensor(angle)).item() * speed,
                            T.sin(T.tensor(angle)).item() * speed]], dtype=T.float32, device=device)
-            swarm.spawn(pos, vel, T.tensor([1.5], device=device))
+            dep = T.tensor([deposit_range[0] + T.rand(1, generator=g, device=device).item() * (deposit_range[1] - deposit_range[0])], device=device)
+            swarm.spawn(pos, vel, T.tensor([1.5], device=device), dep)
 
-        # Emit from goal
+        # Emit from goal (biased toward start)
+        angle_to_start = angle_to_goal + 3.14159  # Opposite direction
         for _ in range(terminal_emit):
-            angle = T.rand(1, generator=g, device=device).item() * 2 * 3.14159
+            spread = (T.rand(1, generator=g, device=device).item() - 0.5) * 2.1
+            angle = angle_to_start + spread
             speed = speed_range[0] + T.rand(1, generator=g, device=device).item() * (speed_range[1] - speed_range[0])
 
             pos = T.tensor([[goal[1], goal[0]]], dtype=T.float32, device=device)
             vel = T.tensor([[T.cos(T.tensor(angle)).item() * speed,
                            T.sin(T.tensor(angle)).item() * speed]], dtype=T.float32, device=device)
-            swarm.spawn(pos, vel, T.tensor([1.5], device=device))
+            dep = T.tensor([deposit_range[0] + T.rand(1, generator=g, device=device).item() * (deposit_range[1] - deposit_range[0])], device=device)
+            swarm.spawn(pos, vel, T.tensor([1.5], device=device), dep)
 
         # 3. Update particles - they deposit energy and create trails
-        swarm.update(maze01, x, deposit)
+        swarm.update(maze01, x)
 
         # === FIELD DYNAMICS ===
 
@@ -277,7 +293,8 @@ def main():
     parser.add_argument('--emit', type=int, default=3, help='Particles from terminals per frame (default: 3)')
     parser.add_argument('--speed-min', type=float, default=0.2, help='Min particle speed (default: 0.2)')
     parser.add_argument('--speed-max', type=float, default=0.8, help='Max particle speed (default: 0.8)')
-    parser.add_argument('--deposit', type=float, default=0.25, help='Energy deposited by particles (default: 0.25)')
+    parser.add_argument('--min-deposit', type=float, default=0.1, help='Min energy deposited by particles (default: 0.1)')
+    parser.add_argument('--max-deposit', type=float, default=0.4, help='Max energy deposited by particles (default: 0.4)')
     parser.add_argument('--decay', type=float, default=0.15, help='Field decay rate (default: 0.15)')
     parser.add_argument('--kappa', type=float, default=3.0, help='Neighbor reinforcement (default: 3.0)')
     parser.add_argument('--gamma', type=float, default=0.05, help='Field spread rate (default: 0.05)')
@@ -305,8 +322,7 @@ def main():
 
     console.print(f"Maze: {H}×{W} | Obstacles: {int(maze.sum())}")
     console.print(f"Ionization: {args.ionization} | Emit: {args.emit} particles/frame")
-    console.print(f"Speed: {args.speed_min}-{args.speed_max} | Deposit: {args.deposit} | Decay: {args.decay}\n")
-    console.print("[dim]Watch lightning tendrils explore and connect![/dim]\n")
+    console.print(f"Speed: {args.speed_min}-{args.speed_max} | Deposit: {args.min_deposit}-{args.max_deposit} | Decay: {args.decay}\n")
 
     time.sleep(1)
 
@@ -325,7 +341,7 @@ def main():
                 ionization_rate=args.ionization,
                 terminal_emit=args.emit,
                 speed_range=(args.speed_min, args.speed_max),
-                deposit=args.deposit,
+                deposit_range=(args.min_deposit, args.max_deposit),
                 alpha=args.decay,
                 kappa=args.kappa,
                 gamma=args.gamma,
@@ -352,7 +368,7 @@ def main():
                     ionization_rate=args.ionization,
                     terminal_emit=args.emit,
                     speed_range=(args.speed_min, args.speed_max),
-                    deposit=args.deposit,
+                    deposit_range=(args.min_deposit, args.max_deposit),
                     alpha=args.decay,
                     kappa=args.kappa,
                     gamma=args.gamma,
