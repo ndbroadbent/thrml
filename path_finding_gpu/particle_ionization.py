@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
-"""Particle-based ionization pathfinder.
+"""Hybrid field + particle ionization pathfinder.
 
-Instead of field dynamics, simulate actual particles:
-- Particles emitted from start/goal with random velocities
-- Move through grid leaving ionization trails
-- Stop immediately when hitting walls
-- Trails decay over time
-- When trails overlap between terminals → path emerges!
+Combines:
+- Excitable field dynamics (spreading, decay, reinforcement)
+- Particles with velocity spawned from ionization events
+- Particles leave trails as they move, creating directional tendrils
+- Not blobs - lightning-like branching exploration!
 
-Like watching a cloud chamber! ☁️⚛️
+Ionization events spawn particles with random velocity → directional exploration
+Field dynamics reinforce connected trails → chains persist
+Result: Lightning tendrils from terminals exploring and connecting!
 """
 import torch as T
+import torch.nn.functional as F
 import time
 import sys
 import argparse
@@ -26,27 +28,25 @@ console = Console()
 
 
 def wait_for_space(console):
-    """Wait for spacebar press in debugger mode."""
+    """Wait for spacebar press."""
     import termios
     import tty
 
-    console.print("[dim]Press SPACE for next frame, Ctrl+C to exit...[/dim]", end="")
-
+    console.print("[dim]SPACE=next Ctrl+C=exit[/dim]", end="")
     fd = sys.stdin.fileno()
     old_settings = termios.tcgetattr(fd)
     try:
         tty.setraw(fd)
         ch = sys.stdin.read(1)
-        if ch == '\x03':  # Ctrl+C
+        if ch == '\x03':
             raise KeyboardInterrupt
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-
-    console.print("\r" + " " * 60 + "\r", end="")
+    console.print("\r" + " " * 30 + "\r", end="")
 
 
 class ParticleSwarm:
-    """Manage a swarm of particles with position and velocity."""
+    """Particles with position and velocity."""
 
     def __init__(self, max_particles, H, W, device):
         self.max_particles = max_particles
@@ -54,125 +54,174 @@ class ParticleSwarm:
         self.W = W
         self.device = device
 
-        # Particle state: [max_particles, 4] = [x, y, vx, vy]
-        # x, y are float positions, vx, vy are velocities
+        # [x, y, vx, vy] - float positions and velocities
         self.particles = T.zeros((max_particles, 4), device=device)
         self.active = T.zeros(max_particles, dtype=T.bool, device=device)
-        self.energy = T.zeros(max_particles, device=device)  # Particle energy
+        self.lifetime = T.zeros(max_particles, device=device)
 
-    def emit(self, pos, n_particles, speed_range, rng):
-        """Emit particles from a position with random velocities."""
-        # Find inactive slots
-        inactive = (~self.active).nonzero(as_tuple=True)[0]
-        if len(inactive) < n_particles:
-            n_particles = len(inactive)
-
-        if n_particles == 0:
+    def spawn(self, positions, velocities, lifetimes):
+        """Spawn particles at positions with given velocities."""
+        n = len(positions)
+        if n == 0:
             return
 
-        slots = inactive[:n_particles]
+        inactive = (~self.active).nonzero(as_tuple=True)[0]
+        if len(inactive) < n:
+            n = len(inactive)
 
-        # Set positions
-        self.particles[slots, 0] = pos[1]  # x (col)
-        self.particles[slots, 1] = pos[0]  # y (row)
-
-        # Random velocities
-        angles = T.rand(n_particles, device=self.device, generator=rng) * 2 * 3.14159
-        speeds = speed_range[0] + T.rand(n_particles, device=self.device, generator=rng) * (speed_range[1] - speed_range[0])
-
-        self.particles[slots, 2] = T.cos(angles) * speeds  # vx
-        self.particles[slots, 3] = T.sin(angles) * speeds  # vy
-
+        slots = inactive[:n]
+        self.particles[slots, :2] = positions[:n]  # x, y
+        self.particles[slots, 2:] = velocities[:n]  # vx, vy
         self.active[slots] = True
-        self.energy[slots] = 1.0
+        self.lifetime[slots] = lifetimes[:n]
 
-    def step(self, maze, trail_field, deposit_amount):
-        """Move particles and deposit energy in trail field."""
+    def update(self, maze, field, deposit):
+        """Move particles, deposit energy, check collisions."""
         if not self.active.any():
             return
 
-        # Move active particles
-        active_mask = self.active
+        active_idx = self.active.nonzero(as_tuple=True)[0]
 
-        # Update positions
-        self.particles[active_mask, 0] += self.particles[active_mask, 2]  # x += vx
-        self.particles[active_mask, 1] += self.particles[active_mask, 3]  # y += vy
+        # Move
+        self.particles[active_idx, 0] += self.particles[active_idx, 2]  # x += vx
+        self.particles[active_idx, 1] += self.particles[active_idx, 3]  # y += vy
 
-        # Get integer grid positions
-        px = self.particles[active_mask, 0].long().clamp(0, self.W - 1)
-        py = self.particles[active_mask, 1].long().clamp(0, self.H - 1)
+        # Get grid positions
+        px = self.particles[active_idx, 0].long().clamp(0, self.W - 1)
+        py = self.particles[active_idx, 1].long().clamp(0, self.H - 1)
 
-        # Check for walls or out of bounds
+        # Deposit energy in field
+        for i, (y, x) in enumerate(zip(py, px)):
+            if maze[y, x] == 0:  # Not a wall
+                field[0, 0, y, x] += deposit * self.lifetime[active_idx[i]]
+
+        # Check walls - stop particles immediately
         hit_wall = maze[py, px] == 1
+        stopped = active_idx[hit_wall]
+        self.active[stopped] = False
 
-        # Deposit energy in trail (only if not hitting wall)
-        active_indices = active_mask.nonzero(as_tuple=True)[0]
-        for idx, (i, j, wall) in enumerate(zip(py, px, hit_wall)):
-            if not wall:
-                trail_field[0, 0, i, j] += deposit_amount * self.energy[active_indices[idx]]
-
-        # Deactivate particles that hit walls
-        hit_indices = active_indices[hit_wall]
-        self.active[hit_indices] = False
-
-        # Deactivate particles that went out of bounds or decayed
-        self.energy[active_mask] *= 0.98  # Particle energy decays
-        depleted = self.energy < 0.01
+        # Age particles
+        self.lifetime[active_idx] *= 0.95
+        depleted = self.lifetime < 0.1
         self.active[depleted] = False
 
 
-def particle_pathfinder(
+def hybrid_pathfinder(
     maze01,
     start,
     goal,
     steps=1000,
-    max_particles=2000,
-    emit_rate=2,           # Particles emitted per frame from each terminal
-    speed_range=(0.3, 1.5), # Min/max particle speed
-    deposit=0.15,          # Energy deposited in trail
-    decay=0.03,            # Trail decay rate
+    max_particles=1000,
+    ionization_rate=0.0005,  # Random ionization events
+    terminal_emit=3,         # Particles from start/goal per frame
+    speed_range=(0.2, 0.8),  # Particle speed
+    deposit=0.25,            # Energy deposited by particles
+    alpha=0.15,              # Field decay
+    kappa=3.0,               # Reinforcement from neighbors
+    gamma=0.05,              # Field spreading
+    theta=0.2,               # Excitation threshold
     seed=0,
     visualize_fn=None,
 ):
     """
-    Particle-based pathfinder:
-    - Emit particles from start and goal with random velocities
-    - Particles leave ionization trails
-    - Trails decay over time
-    - Solution = bright connected trail between terminals
+    Hybrid: Field dynamics + particle exploration
+
+    - Random ionization events spawn particles with momentum
+    - Particles explore creating directional tendrils (not blobs!)
+    - Field dynamics reinforce connected regions
+    - Start/goal emit particles and charge neighbors
+    - Lightning-like branching emerges!
     """
     g = T.Generator(device=device).manual_seed(seed)
     H, W = maze01.shape
 
-    # Trail field - accumulated ionization
-    trail = T.zeros((1, 1, H, W), device=device)
+    open_mask = (1 - maze01).to(device).float()
+    x = T.zeros((1, 1, H, W), device=device)  # Excitement field
 
-    # Particle swarm
     swarm = ParticleSwarm(max_particles, H, W, device)
 
+    # 4-neighbor kernel for field reinforcement
+    K4 = T.tensor([[0, 1, 0], [1, 0, 1], [0, 1, 0]], dtype=T.float32, device=device)[None, None]
+
     for t in range(steps):
-        # Emit particles from terminals
-        swarm.emit(start, emit_rate, speed_range, g)
-        swarm.emit(goal, emit_rate, speed_range, g)
+        # === PARTICLE DYNAMICS ===
 
-        # Move particles and deposit energy
-        swarm.step(maze01, trail, deposit)
+        # 1. Random ionization events spawn particles
+        if ionization_rate > 0:
+            ion_mask = (T.rand((H, W), generator=g, device=device) < ionization_rate) & (maze01 == 0)
+            ion_mask = ion_mask & (x[0, 0] < 0.05)  # Only spawn in calm regions
+            ion_pos = ion_mask.nonzero(as_tuple=False)
 
-        # Trail decay
-        trail = trail * (1.0 - decay)
-        trail = trail.clamp(0, 1)
+            if len(ion_pos) > 0:
+                # Random velocities for ionization particles
+                n = len(ion_pos)
+                angles = T.rand(n, generator=g, device=device) * 2 * 3.14159
+                speeds = speed_range[0] + T.rand(n, generator=g, device=device) * (speed_range[1] - speed_range[0])
+
+                positions = T.stack([ion_pos[:, 1].float(), ion_pos[:, 0].float()], dim=1)  # x, y
+                velocities = T.stack([T.cos(angles) * speeds, T.sin(angles) * speeds], dim=1)
+                lifetimes = T.ones(n, device=device)
+
+                swarm.spawn(positions, velocities, lifetimes)
+
+        # 2. Terminals emit particles toward excited neighbors
+        excited = (x > theta).float()
+
+        # Emit from start
+        for _ in range(terminal_emit):
+            angle = T.rand(1, generator=g, device=device).item() * 2 * 3.14159
+            speed = speed_range[0] + T.rand(1, generator=g, device=device).item() * (speed_range[1] - speed_range[0])
+
+            pos = T.tensor([[start[1], start[0]]], dtype=T.float32, device=device)
+            vel = T.tensor([[T.cos(T.tensor(angle)).item() * speed,
+                           T.sin(T.tensor(angle)).item() * speed]], dtype=T.float32, device=device)
+            swarm.spawn(pos, vel, T.tensor([1.5], device=device))
+
+        # Emit from goal
+        for _ in range(terminal_emit):
+            angle = T.rand(1, generator=g, device=device).item() * 2 * 3.14159
+            speed = speed_range[0] + T.rand(1, generator=g, device=device).item() * (speed_range[1] - speed_range[0])
+
+            pos = T.tensor([[goal[1], goal[0]]], dtype=T.float32, device=device)
+            vel = T.tensor([[T.cos(T.tensor(angle)).item() * speed,
+                           T.sin(T.tensor(angle)).item() * speed]], dtype=T.float32, device=device)
+            swarm.spawn(pos, vel, T.tensor([1.5], device=device))
+
+        # 3. Update particles - they deposit energy and create trails
+        swarm.update(maze01, x, deposit)
+
+        # === FIELD DYNAMICS ===
+
+        # Neighbor reinforcement (keeps chains alive)
+        N = F.conv2d(excited, K4, padding="same") * open_mask
+        reinforce = kappa * N
+
+        # Decay with reinforcement slowdown
+        leak = alpha / (1.0 + reinforce)
+        leak = T.maximum(leak, T.tensor(alpha * 0.15, device=device))  # Min decay
+
+        # Field spreading from excited neighbors
+        spread = gamma * N
+
+        # Update field
+        x = (1 - leak) * x + spread
+        x = x.clamp(0, 1) * open_mask
+
+        # Keep terminals alive
+        x[0, 0, start[0], start[1]] = T.maximum(x[0, 0, start[0], start[1]], T.tensor(0.3, device=device))
+        x[0, 0, goal[0], goal[1]] = T.maximum(x[0, 0, goal[0], goal[1]], T.tensor(0.3, device=device))
 
         # Visualization
         if visualize_fn:
-            visualize_fn(t, trail, swarm)
+            visualize_fn(t, x, swarm)
 
-    return None  # Pure emergence - no path extraction!
+    return None
 
 
-def render_terminal(t, trail, swarm, maze01, start, goal, H, W):
-    """Render particle trails."""
+def render_terminal(t, x, swarm, maze01, start, goal, H, W):
+    """Render field + particles."""
 
-    excitement = trail[0, 0].cpu().numpy()
+    excitement = x[0, 0].cpu().numpy()
 
     lines = []
 
@@ -207,51 +256,40 @@ def render_terminal(t, trail, swarm, maze01, start, goal, H, W):
 
         lines.append(row)
 
-    # Stats
+    active_p = int(swarm.active.sum())
     total = float(excitement.sum())
     max_exc = float(excitement.max())
-    active_particles = int(swarm.active.sum())
 
-    stats = f"Step {t:4d} | Particles: {active_particles:3d} | Trail Energy: {total:6.1f} | Max: {max_exc:.2f}"
+    stats = f"Step {t:4d} | Particles: {active_p:3d} | Energy: {total:6.1f} | Max: {max_exc:.2f}"
 
-    content = "\n".join(lines)
-
-    return Panel(
-        content,
-        subtitle=stats,
-        border_style="bright_blue",
-        expand=False
-    )
+    return Panel("\n".join(lines), subtitle=stats, border_style="bright_blue", expand=False)
 
 
 def main():
-    """Main entry."""
-    parser = argparse.ArgumentParser(
-        description="⚛️  Particle Ionization Pathfinder - Particles leave trails!",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
+    parser = argparse.ArgumentParser(description="⚛️  Particle + Field Hybrid Pathfinder")
 
     parser.add_argument('--size', type=int, default=25, help='Maze size (default: 25)')
     parser.add_argument('--obstacles', type=float, default=0.10, help='Obstacle density (default: 0.10)')
-    parser.add_argument('--seed', type=int, default=42, help='Maze seed')
+    parser.add_argument('--seed', type=int, default=42, help='Maze seed (default: 42)')
 
-    parser.add_argument('--steps', type=int, default=1000, help='Simulation steps')
-    parser.add_argument('--max-particles', type=int, default=2000, help='Max particles (default: 2000)')
-    parser.add_argument('--emit', type=int, default=2, help='Particles emitted per frame (default: 2)')
-    parser.add_argument('--speed-min', type=float, default=0.3, help='Min particle speed (default: 0.3)')
-    parser.add_argument('--speed-max', type=float, default=1.5, help='Max particle speed (default: 1.5)')
-    parser.add_argument('--deposit', type=float, default=0.15, help='Trail deposit amount (default: 0.15)')
-    parser.add_argument('--decay', type=float, default=0.03, help='Trail decay rate (default: 0.03)')
+    parser.add_argument('--steps', type=int, default=1500, help='Simulation steps (default: 1500)')
+    parser.add_argument('--ionization', type=float, default=0.0005, help='Random ionization rate (default: 0.0005)')
+    parser.add_argument('--emit', type=int, default=3, help='Particles from terminals per frame (default: 3)')
+    parser.add_argument('--speed-min', type=float, default=0.2, help='Min particle speed (default: 0.2)')
+    parser.add_argument('--speed-max', type=float, default=0.8, help='Max particle speed (default: 0.8)')
+    parser.add_argument('--deposit', type=float, default=0.25, help='Energy deposited by particles (default: 0.25)')
+    parser.add_argument('--decay', type=float, default=0.15, help='Field decay rate (default: 0.15)')
+    parser.add_argument('--kappa', type=float, default=3.0, help='Neighbor reinforcement (default: 3.0)')
+    parser.add_argument('--gamma', type=float, default=0.05, help='Field spread rate (default: 0.05)')
 
     parser.add_argument('--fps', type=int, default=10, help='Steps per second (default: 10)')
-    parser.add_argument('--debugger', action='store_true', help='Step-through mode')
+    parser.add_argument('--debugger', action='store_true', help='Step-through mode (SPACE to advance)')
 
     args = parser.parse_args()
 
     console.clear()
     console.print(f"\n[bold cyan]⚛️  Particle Ionization Pathfinder {'[DEBUG]' if args.debugger else ''} ⚛️[/bold cyan]\n")
 
-    # Create maze
     H = W = args.size
     maze = T.zeros((H, W))
 
@@ -265,29 +303,33 @@ def main():
     maze[start] = 0
     maze[goal] = 0
 
-    console.print(f"Maze: {H}×{W} | Obstacles: {int(maze.sum())} | Device: {device}")
-    console.print(f"Emit: {args.emit} particles/frame | Speed: {args.speed_min}-{args.speed_max}")
-    console.print(f"Deposit: {args.deposit} | Decay: {args.decay}\n")
-    console.print("[dim]Watch particles leave ionization trails![/dim]\n")
+    console.print(f"Maze: {H}×{W} | Obstacles: {int(maze.sum())}")
+    console.print(f"Ionization: {args.ionization} | Emit: {args.emit} particles/frame")
+    console.print(f"Speed: {args.speed_min}-{args.speed_max} | Deposit: {args.deposit} | Decay: {args.decay}\n")
+    console.print("[dim]Watch lightning tendrils explore and connect![/dim]\n")
 
     time.sleep(1)
 
     if args.debugger:
-        def viz(t, trail, swarm):
-            panel = render_terminal(t, trail, swarm, maze, start, goal, H, W)
+        def viz(t, x, swarm):
+            panel = render_terminal(t, x, swarm, maze, start, goal, H, W)
             console.clear()
             console.print(panel)
             wait_for_space(console)
 
         try:
-            particle_pathfinder(
+            hybrid_pathfinder(
                 maze, start, goal,
                 steps=args.steps,
-                max_particles=args.max_particles,
-                emit_rate=args.emit,
+                max_particles=2000,
+                ionization_rate=args.ionization,
+                terminal_emit=args.emit,
                 speed_range=(args.speed_min, args.speed_max),
                 deposit=args.deposit,
-                decay=args.decay,
+                alpha=args.decay,
+                kappa=args.kappa,
+                gamma=args.gamma,
+                theta=0.2,
                 seed=int(time.time()) % 1000,
                 visualize_fn=viz
             )
@@ -297,29 +339,32 @@ def main():
         step_delay = 1.0 / args.fps
 
         with Live(console=console, refresh_per_second=30) as live:
-            def viz(t, trail, swarm):
-                panel = render_terminal(t, trail, swarm, maze, start, goal, H, W)
+            def viz(t, x, swarm):
+                panel = render_terminal(t, x, swarm, maze, start, goal, H, W)
                 live.update(panel)
                 time.sleep(step_delay)
 
             try:
-                particle_pathfinder(
+                hybrid_pathfinder(
                     maze, start, goal,
                     steps=args.steps,
-                    max_particles=args.max_particles,
-                    emit_rate=args.emit,
+                    max_particles=2000,
+                    ionization_rate=args.ionization,
+                    terminal_emit=args.emit,
                     speed_range=(args.speed_min, args.speed_max),
                     deposit=args.deposit,
-                    decay=args.decay,
+                    alpha=args.decay,
+                    kappa=args.kappa,
+                    gamma=args.gamma,
+                    theta=0.2,
                     seed=int(time.time()) % 1000,
                     visualize_fn=viz
                 )
             except KeyboardInterrupt:
                 console.print("\n[yellow]Interrupted[/yellow]")
 
-    console.print(f"\n[dim]Ionization trails show the explored space[/dim]")
+    console.print(f"\n[dim]Lightning tendrils create branching exploration![/dim]")
 
 
 if __name__ == "__main__":
     main()
-
