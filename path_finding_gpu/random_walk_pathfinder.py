@@ -115,6 +115,7 @@ def random_walk_pathfinder(
     pulse_interval=20,              # Frames between terminal energy pulses (0 = disabled)
     pulse_energy=0.8,               # Energy level for pulses (< 1.0 to avoid constant white)
     pulse_falloff=0.01,             # Energy decrease per cell for pulses
+    kill_on_collision=True,         # Whether walkers die when collisions occur
     turn_chance=0.1,                # Probability to turn left/right instead of forward
     seed=0,
     visualize_fn=None,
@@ -270,49 +271,54 @@ def random_walk_pathfinder(
                 continue
 
             # CHECK FOR COLLISION
-            # Hit ANY existing trail (not own) or another walker
             collision = False
 
             # Use appropriate threshold based on trail type
             threshold = bastion_threshold if bastion_mask[next_pos] > 0.5 else backprop_threshold
+            current_exc = float(field[walker.pos].item())
+            allow_pass_through = (not kill_on_collision) and current_exc >= threshold
 
             # Check if stepping onto ANY trail (field energy > threshold, not own trail)
             if field[next_pos] > threshold and next_pos not in walker.trail:
-                # Hit an existing trail!
-                collision = True
+                if allow_pass_through:
+                    pass  # Keep walking through high-energy region
+                else:
+                    # Hit an existing trail!
+                    # First, add walker's trail to field
+                    for pos in walker.trail:
+                        field[pos] = max(field[pos].item(), walker.energy)
+                        if walker.is_bastion:
+                            bastion_mask[pos] = 1.0
+                    field[next_pos] = max(field[next_pos].item(), walker.energy)
 
-                # First, add walker's trail to field
-                for pos in walker.trail:
-                    field[pos] = max(field[pos].item(), walker.energy)
-                    if walker.is_bastion:
-                        bastion_mask[pos] = 1.0
-                field[next_pos] = max(field[next_pos].item(), walker.energy)
+                    # Now flood-fill to find ALL connected cells with distances
+                    connected_with_dist = flood_fill_connected_with_distance(
+                        field, next_pos, threshold, H, W
+                    )
 
-                # Now flood-fill to find ALL connected cells with distances
-                connected_with_dist = flood_fill_connected_with_distance(
-                    field, next_pos, threshold, H, W
-                )
+                    # Collect cells to flash AFTER decay, with energy gradient
+                    # Use bastion falloff if walker is bastion (spreads further!)
+                    falloff = bastion_backprop_falloff if walker.is_bastion else backprop_falloff
+                    for pos, dist in connected_with_dist.items():
+                        # Energy decreases with distance from collision
+                        energy = max(1.0 - dist * falloff, threshold)
+                        cells_to_flash.append((pos, energy))
 
-                # Collect cells to flash AFTER decay, with energy gradient
-                # Use bastion falloff if walker is bastion (spreads further!)
-                falloff = bastion_backprop_falloff if walker.is_bastion else backprop_falloff
-                for pos, dist in connected_with_dist.items():
-                    # Energy decreases with distance from collision
-                    energy = max(1.0 - dist * falloff, threshold)
-                    cells_to_flash.append((pos, energy))
-
-                collided_walkers.add(walker.id)
-                # Don't add to new_walkers - walker consumed by connection
-                continue
+                    if kill_on_collision:
+                        collided_walkers.add(walker.id)
+                        continue
 
             # Check if adjacent to another active walker head
             for other in walkers:
                 if other.alive and other.id != walker.id and other.id not in collided_walkers:
                     if abs(next_pos[0] - other.pos[0]) + abs(next_pos[1] - other.pos[1]) == 1:
-                        # Head-to-head collision
-                        collision = True
-                        collided_walkers.add(walker.id)
-                        collided_walkers.add(other.id)
+                        if allow_pass_through:
+                            continue
+
+                        collision = kill_on_collision
+                        if kill_on_collision:
+                            collided_walkers.add(walker.id)
+                            collided_walkers.add(other.id)
 
                         # Add both trails to field
                         for pos in walker.trail:
@@ -491,6 +497,7 @@ def main():
     parser.add_argument('--pulse-interval', type=int, default=15, help='Frames between terminal pulses, 0=off (default: 15)')
     parser.add_argument('--pulse-energy', type=float, default=0.8, help='Terminal pulse energy level (default: 0.8)')
     parser.add_argument('--pulse-falloff', type=float, default=0.01, help='Terminal pulse falloff per cell (default: 0.01)')
+    parser.add_argument('--no-collision-kill', action='store_true', help='Allow walkers to keep moving after collisions (default: False)')
     parser.add_argument('--turn-chance', type=float, default=0.1, help='Probability to turn instead of forward (default: 0.1)')
 
     parser.add_argument('--fps', type=int, default=60, help='Steps per second (default: 60)')
@@ -559,6 +566,7 @@ def main():
                 pulse_interval=args.pulse_interval,
                 pulse_energy=args.pulse_energy,
                 pulse_falloff=args.pulse_falloff,
+                kill_on_collision=not args.no_collision_kill,
                 turn_chance=args.turn_chance,
                 seed=int(time.time()) % 1000,
                 visualize_fn=viz
@@ -591,6 +599,7 @@ def main():
                     pulse_interval=args.pulse_interval,
                     pulse_energy=args.pulse_energy,
                     pulse_falloff=args.pulse_falloff,
+                    kill_on_collision=not args.no_collision_kill,
                     turn_chance=args.turn_chance,
                     seed=int(time.time()) % 1000,
                     visualize_fn=viz
