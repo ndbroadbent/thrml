@@ -49,6 +49,28 @@ class Walker:
         self.is_bastion = is_bastion  # Spawned from terminal
 
 
+# Continuous color gradient stops (energy, (r,g,b))
+COLOR_STOPS = [
+    (1.0, (255, 255, 255)),   # white
+    (0.85, (0, 255, 255)),    # cyan
+    (0.0, (0, 0, 30)),        # deep dark blue
+]
+
+
+def interpolate_color(c1, c2, t):
+    return tuple(int(c1[i] + (c2[i] - c1[i]) * t) for i in range(3))
+
+
+def energy_to_color(exc):
+    exc = float(max(0.0, min(1.0, exc)))
+    for (hi_e, hi_c), (lo_e, lo_c) in zip(COLOR_STOPS, COLOR_STOPS[1:]):
+        if exc >= lo_e:
+            span = hi_e - lo_e
+            t = 0.0 if span == 0 else (exc - lo_e) / span
+            return interpolate_color(lo_c, hi_c, t)
+    return COLOR_STOPS[-1][1]
+
+
 def flood_fill_connected_with_distance(field, start_pos, threshold, H, W):
     """
     Find all cells connected to start_pos with energy > threshold.
@@ -338,7 +360,7 @@ def random_walk_pathfinder(
         # Apply different decay rates for bastion vs regular trails
         decay_rate = bastion_mask * bastion_decay + (1.0 - bastion_mask) * trail_decay
         field = field * (1.0 - decay_rate)
-        field = field.clamp(0, 1)
+        field = field.clamp(min=0.0)
 
         # === FLASH CONNECTED NETWORKS (after decay!) ===
         for pos, energy in cells_to_flash:
@@ -357,14 +379,16 @@ def random_walk_pathfinder(
                 field, start, bastion_threshold, H, W
             )
             for pos, dist in start_connected.items():
-                pulse_e = max(pulse_energy - dist * pulse_falloff, bastion_threshold)
+                effective_dist = max(0, dist - 1)  # Adjacent cells stay at full pulse energy
+                pulse_e = max(pulse_energy - effective_dist * pulse_falloff, bastion_threshold)
                 field[pos] = max(field[pos].item(), pulse_e)
 
             goal_connected = flood_fill_connected_with_distance(
                 field, goal, bastion_threshold, H, W
             )
             for pos, dist in goal_connected.items():
-                pulse_e = max(pulse_energy - dist * pulse_falloff, bastion_threshold)
+                effective_dist = max(0, dist - 1)
+                pulse_e = max(pulse_energy - effective_dist * pulse_falloff, bastion_threshold)
                 field[pos] = max(field[pos].item(), pulse_e)
         else:
             # Keep terminals at high energy (but not 1.0 so they don't flash)
@@ -431,42 +455,9 @@ def render_terminal(t, field, walkers, maze01, start, goal, H, W, is_pulse_frame
                     row += "[rgb(255,255,255)]██[/rgb(255,255,255)]"
                 else:
                     row += "[red]██[/red]"
-            elif exc >= 1.0:
-                # Maximum energy (collisions, etc) - bright white
-                row += "[rgb(255,255,255)]██[/rgb(255,255,255)]"
-            elif exc >= 0.96:
-                # Very high - bright cyan
-                row += "[rgb(0,255,255)]██[/rgb(0,255,255)]"
-            elif exc >= 0.85:
-                # High - cyan
-                row += f"[rgb(0,{int(180 + (exc - 0.85) * 682)},{int(200 + (exc - 0.85) * 500)})]██[/rgb(0,{int(180 + (exc - 0.85) * 682)},{int(200 + (exc - 0.85) * 500)})]"
-            elif exc >= 0.6:
-                # Medium-high - bright blue
-                r = int((exc - 0.6) * 0 / 0.25)
-                g = int(100 + (exc - 0.6) * 320)  # 100 → 180
-                b = int(200 + (exc - 0.6) * 220)  # 200 → 255
-                row += f"[rgb({r},{g},{b})]██[/rgb({r},{g},{b})]"
-            elif exc >= 0.3:
-                # Medium - blue
-                r = 0
-                g = int(50 + (exc - 0.3) * 167)  # 50 → 100
-                b = int(150 + (exc - 0.3) * 167)  # 150 → 200
-                row += f"[rgb({r},{g},{b})]██[/rgb({r},{g},{b})]"
-            elif exc >= 0.1:
-                # Low - dark blue
-                r = 0
-                g = int((exc - 0.1) * 250)  # 0 → 50
-                b = int(80 + (exc - 0.1) * 350)  # 80 → 150
-                row += f"[rgb({r},{g},{b})]██[/rgb({r},{g},{b})]"
-            elif exc >= 0.01:
-                # Very low - very dark blue
-                r = 0
-                g = 0
-                b = int(30 + (exc - 0.01) * 556)  # 30 → 80
-                row += f"[rgb({r},{g},{b})]██[/rgb({r},{g},{b})]"
             else:
-                # No energy - deep dark blue (almost black)
-                row += "[rgb(0,0,30)]██[/rgb(0,0,30)]"
+                r, g, b = energy_to_color(exc)
+                row += f"[rgb({r},{g},{b})]██[/rgb({r},{g},{b})]"
 
         lines.append(row)
 
@@ -527,20 +518,19 @@ def main():
     console.print(f"Bastion: {args.bastion_rate} | Random: {args.random_rate} | Turn: {args.turn_chance}")
     console.print(f"Decay: {args.decay} | Halflife: {args.halflife} | Backprop: {args.backprop_threshold}\n")
 
-    # Energy scale legend
+    # Energy scale legend (dynamic, continuous)
     console.print("[bold]Energy Scale:[/bold]")
-    console.print("[dim]1.0=[/dim][rgb(255,255,255)]██[/rgb(255,255,255)] "
-                  "[dim]0.96=[/dim][rgb(0,255,255)]██[/rgb(0,255,255)] "
-                  "[dim]0.9=[/dim][rgb(0,200,230)]██[/rgb(0,200,230)] "
-                  "[dim]0.85=[/dim][rgb(0,180,200)]██[/rgb(0,180,200)] "
-                  "[dim]0.7=[/dim][rgb(0,140,230)]██[/rgb(0,140,230)]")
-    console.print("[dim]0.6=[/dim][rgb(0,100,200)]██[/rgb(0,100,200)] "
-                  "[dim]0.45=[/dim][rgb(0,75,175)]██[/rgb(0,75,175)] "
-                  "[dim]0.3=[/dim][rgb(0,50,150)]██[/rgb(0,50,150)] "
-                  "[dim]0.2=[/dim][rgb(0,30,120)]██[/rgb(0,30,120)] "
-                  "[dim]0.1=[/dim][rgb(0,10,80)]██[/rgb(0,10,80)] "
-                  "[dim]0.05=[/dim][rgb(0,0,55)]██[/rgb(0,0,55)] "
-                  "[dim]0.0=[/dim][rgb(0,0,30)]██[/rgb(0,0,30)]")
+    legend_values = [round(i * 0.1, 1) for i in range(10, -1, -1)]
+    chunk_size = 6
+    for idx in range(0, len(legend_values), chunk_size):
+        chunk = legend_values[idx:idx + chunk_size]
+        parts = []
+        for val in chunk:
+            r, g, b = energy_to_color(val)
+            parts.append(
+                f"[dim]{val:>4.1f}=[/dim][rgb({r},{g},{b})]██[/rgb({r},{g},{b})]"
+            )
+        console.print(" ".join(parts))
     console.print("[dim]Special: [/dim][yellow]██[/yellow][dim]=walker | [/dim][green]██[/green][dim]=start | [/dim][red]██[/red][dim]=goal | [/dim]░░[dim]=wall[/dim]\n")
 
     time.sleep(1)
