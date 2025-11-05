@@ -5,6 +5,7 @@ import numpy as np
 from path_finding.thrml_flow_solver import (
     build_flow_thrml_program,
     decode_flow_path,
+    generate_maze,
     render_flow_path_ascii,
     save_flow_path_png,
     solve_maze_flow,
@@ -158,5 +159,19 @@ def test_save_flow_path_png(tmp_path):
 
     assert outfile.exists()
     assert outfile.stat().st_size > 0
+
+
+def test_generate_maze_variants():
+    """Maze generator should produce diverse layouts with open endpoints."""
+
+    for maze_type in ["random_walls", "dfs_perfect", "recursive_division"]:
+        maze = generate_maze(25, maze_type=maze_type, seed=321)
+        assert maze.shape == (25, 25)
+        assert maze.dtype == np.uint8
+        # Start/goal cells open
+        assert maze[1, 1] == 0
+        assert maze[-2, -2] == 0
+        # There should be at least one wall besides the border
+        assert np.any(maze[1:-1, 1:-1] == 1)
 
 

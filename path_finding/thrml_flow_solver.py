@@ -9,6 +9,7 @@ shortest paths under 4-neighbour connectivity.
 from __future__ import annotations
 
 from collections import deque
+import itertools
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -74,6 +75,259 @@ def auto_start_goal(maze: np.ndarray) -> Tuple[GridCoord, GridCoord]:
         raise ValueError("Maze must contain at least one open cell for start/goal")
 
     return start, goal
+
+
+def _maze_random_walls(
+    size: int,
+    rng: np.random.Generator,
+    obstacle_rate: float,
+    add_mid_barrier: bool,
+    edge_rate: float,
+) -> np.ndarray:
+    if size <= 2:
+        return np.zeros((size, size), dtype=np.uint8)
+
+    maze = np.zeros((size, size), dtype=np.uint8)
+    interior = (rng.random((size - 2, size - 2)) < obstacle_rate).astype(np.uint8)
+    maze[1:-1, 1:-1] = interior
+
+    if edge_rate > 0.0:
+        for idx in range(1, size - 1):
+            if rng.random() < edge_rate:
+                maze[0, idx] = 1
+            if rng.random() < edge_rate:
+                maze[-1, idx] = 1
+            if rng.random() < edge_rate:
+                maze[idx, 0] = 1
+            if rng.random() < edge_rate:
+                maze[idx, -1] = 1
+
+    if add_mid_barrier and size >= 12:
+        mid = size // 2
+        maze[mid, :] = 1
+        gap_cols = {
+            max(1, size // 4),
+            min(size - 2, (3 * size) // 4),
+        }
+        for gc in gap_cols:
+            maze[mid, gc] = 0
+
+    maze[1, 1] = 0
+    maze[-2, -2] = 0
+    maze[0, 0] = 0
+    maze[-1, -1] = 0
+    return maze
+
+
+def _maze_perfect_dfs(size: int, rng: np.random.Generator) -> np.ndarray:
+    if size <= 2:
+        return np.zeros((size, size), dtype=np.uint8)
+
+    maze = np.ones((size, size), dtype=np.uint8)
+    visited = np.zeros((size, size), dtype=bool)
+
+    start_cell = (1, 1)
+    stack = [start_cell]
+    visited[start_cell] = True  # type: ignore[index]
+    maze[start_cell] = 0  # type: ignore[index]
+
+    directions = [(-2, 0), (2, 0), (0, -2), (0, 2)]
+
+    while stack:
+        ci, cj = stack[-1]
+        candidates: List[Tuple[int, int, int, int]] = []
+        for di, dj in directions:
+            ni, nj = ci + di, cj + dj
+            if 1 <= ni < size - 1 and 1 <= nj < size - 1 and not visited[ni, nj]:
+                wi, wj = ci + di // 2, cj + dj // 2
+                candidates.append((ni, nj, wi, wj))
+
+        if candidates:
+            ni, nj, wi, wj = candidates[int(rng.integers(len(candidates)))]
+            visited[ni, nj] = True
+            maze[wi, wj] = 0
+            maze[ni, nj] = 0
+            stack.append((ni, nj))
+        else:
+            stack.pop()
+
+    maze[1, 1] = 0
+    maze[-2, -2] = 0
+    return maze
+
+
+def _maze_recursive_division(size: int, rng: np.random.Generator) -> np.ndarray:
+    if size <= 2:
+        return np.zeros((size, size), dtype=np.uint8)
+
+    maze = np.zeros((size, size), dtype=np.uint8)
+    maze[0, :] = 1
+    maze[-1, :] = 1
+    maze[:, 0] = 1
+    maze[:, -1] = 1
+
+    def divide(top: int, bottom: int, left: int, right: int) -> None:
+        if bottom - top < 2 or right - left < 2:
+            return
+
+        horizontal = (bottom - top) >= (right - left)
+
+        if horizontal:
+            possible_rows = [r for r in range(top + 2, bottom, 2)]
+            if not possible_rows:
+                return
+            row = int(rng.choice(possible_rows))
+            maze[row, left:right + 1] = 1
+            gap_options = [c for c in range(left + 1, right, 2)]
+            if gap_options:
+                gap = int(rng.choice(gap_options))
+                maze[row, gap] = 0
+            divide(top, row - 1, left, right)
+            divide(row + 1, bottom, left, right)
+        else:
+            possible_cols = [c for c in range(left + 2, right, 2)]
+            if not possible_cols:
+                return
+            col = int(rng.choice(possible_cols))
+            maze[top:bottom + 1, col] = 1
+            gap_options = [r for r in range(top + 1, bottom, 2)]
+            if gap_options:
+                gap = int(rng.choice(gap_options))
+                maze[gap, col] = 0
+            divide(top, bottom, left, col - 1)
+            divide(top, bottom, col + 1, right)
+
+    divide(0, size - 1, 0, size - 1)
+    maze[1, 1] = 0
+    maze[-2, -2] = 0
+    return maze
+
+
+def _has_path_bfs(maze: np.ndarray, start: GridCoord, goal: GridCoord) -> bool:
+    if maze[start] == 1 or maze[goal] == 1:
+        return False
+
+    height, width = maze.shape
+    queue = deque([start])
+    visited = {start}
+
+    while queue:
+        node = queue.popleft()
+        if node == goal:
+            return True
+        r, c = node
+        for nr, nc in neighbors4(r, c, height, width):
+            nxt = (nr, nc)
+            if maze[nxt] == 1 or nxt in visited:
+                continue
+            visited.add(nxt)
+            queue.append(nxt)
+
+    return False
+
+
+def generate_maze(
+    size: int,
+    *,
+    maze_type: str = "random_walls",
+    seed: int | None = None,
+    obstacle_rate: float = 0.18,
+    add_mid_barrier: bool = True,
+    edge_rate: float = 0.35,
+) -> np.ndarray:
+    """Generate a binary maze (0=open, 1=wall) using different algorithms."""
+
+    rng = np.random.default_rng(seed)
+    base_seed = rng.integers(0, 2**32 - 1, dtype=np.uint32)
+
+    maze_type = maze_type.lower()
+    generators: Dict[str, callable] = {}
+
+    generators.update({
+        "random": lambda g: _maze_random_walls(size, g, obstacle_rate, add_mid_barrier, edge_rate),
+        "random_walls": lambda g: _maze_random_walls(size, g, obstacle_rate, add_mid_barrier, edge_rate),
+        "dfs": lambda g: _maze_perfect_dfs(size, g),
+        "dfs_perfect": lambda g: _maze_perfect_dfs(size, g),
+        "backtracker": lambda g: _maze_perfect_dfs(size, g),
+        "division": lambda g: _maze_recursive_division(size, g),
+        "recursive_division": lambda g: _maze_recursive_division(size, g),
+        "rooms": lambda g: _maze_recursive_division(size, g),
+    })
+
+    if maze_type not in generators:
+        raise ValueError(f"Unknown maze_type '{maze_type}'")
+
+    generator = generators[maze_type]
+
+    for attempt in itertools.count():
+        sub_seed = int((base_seed + attempt) % (2**32 - 1))
+        sub_rng = np.random.default_rng(sub_seed)
+        maze = generator(sub_rng)
+
+        # Guarantee start/goal cells are open and adjacent entries carved.
+        if size > 1:
+            maze[0, 0] = 0
+            maze[-1, -1] = 0
+            if size > 2:
+                maze[0, 1] = 0
+                maze[1, 0] = 0
+                maze[-1, -2] = 0
+                maze[-2, -1] = 0
+                maze[1, 1] = 0
+                maze[-2, -2] = 0
+                if size > 3:
+                    maze[1, 2] = 0
+                    maze[2, 1] = 0
+                    maze[-2, -3] = 0
+                    maze[-3, -2] = 0
+
+        if maze_type in {"random", "random_walls"} and add_mid_barrier and size >= 12:
+            mid = size // 2
+            maze[mid, :] = 1
+            gap_cols = {
+                max(1, size // 4),
+                min(size - 2, (3 * size) // 4),
+            }
+            for gc in gap_cols:
+                maze[mid, gc] = 0
+            maze[0, 0] = 0
+            maze[-1, -1] = 0
+            if size > 2:
+                maze[0, 1] = 0
+                maze[1, 0] = 0
+                maze[-1, -2] = 0
+                maze[-2, -1] = 0
+                maze[1, 1] = 0
+                maze[-2, -2] = 0
+                if size > 3:
+                    maze[1, 2] = 0
+                    maze[2, 1] = 0
+                    maze[-2, -3] = 0
+                    maze[-3, -2] = 0
+
+        if _has_path_bfs(maze, (0, 0), (size - 1, size - 1)):
+            break
+
+    return maze.astype(np.uint8, copy=False)
+
+    # Guarantee start/goal cells are walkable.
+    if size > 1:
+        maze[0, 0] = 0
+        maze[-1, -1] = 0
+        if size > 2:
+            maze[1, 1] = 0
+            maze[-2, -2] = 0
+            maze[0, 1] = 0
+            maze[1, 0] = 0
+            maze[-1, -2] = 0
+            maze[-2, -1] = 0
+            if size > 3:
+                maze[2, 1] = 0
+                maze[1, 2] = 0
+                maze[-3, -2] = 0
+                maze[-2, -3] = 0
+
+    return maze.astype(np.uint8, copy=False)
 
 
 def build_directed_edges(
@@ -461,9 +715,9 @@ def save_flow_path_png(
     if path:
         ys = [coord[0] for coord in path]
         xs = [coord[1] for coord in path]
-        ax.plot(xs, ys, color="white", linewidth=2.2, alpha=0.95)
-        ax.scatter(xs[0], ys[0], c="lime", s=80, edgecolors="black", zorder=5)
-        ax.scatter(xs[-1], ys[-1], c="red", s=80, edgecolors="black", zorder=5)
+        ax.plot(xs, ys, color="white", linewidth=3.4, alpha=0.97)
+        ax.scatter(xs[0], ys[0], c="lime", s=120, edgecolors="black", zorder=6)
+        ax.scatter(xs[-1], ys[-1], c="red", s=120, edgecolors="black", zorder=6)
 
     if edge_probs is not None and dir_edges is not None:
         for prob, (u, v) in zip(edge_probs, dir_edges):
@@ -598,6 +852,7 @@ __all__ = [
     "N_STATES",
     "auto_start_goal",
     "build_flow_thrml_program",
+    "generate_maze",
     "render_flow_path_ascii",
     "save_flow_path_png",
     "decode_flow_path",
@@ -607,32 +862,28 @@ __all__ = [
 
 
 def demo(
-    size: int = 42,
+    size: int = 41,
     obstacle_rate: float = 0.18,
     output_png: str | Path = "thrml_flow_demo.png",
     chains: int = 96,
     warmup: int = 500,
     samples: int = 24,
-    seed: int = 48,
+    seed: int = 17,
+    maze_type: str = "random_walls",  # random_walls, dfs_perfect, recursive_division
+    maze_seed: int | None = None,
 ) -> Tuple[Optional[List[GridCoord]], Dict[str, object]]:
     """Run a sampling demo, print ASCII output, and save a PNG visualisation."""
 
-    rng = np.random.default_rng(seed)
-    maze = np.zeros((size, size), dtype=np.uint8)
-    mask = rng.random((size, size)) < obstacle_rate
-    mask[0, :] = mask[-1, :] = mask[:, 0] = mask[:, -1] = False
-    maze[mask] = 1
+    if maze_seed is None:
+        maze_seed = seed
 
-    # Add a horizontal barrier spanning the full width to avoid trivial perimeter paths.
-    if size >= 12:
-        mid_row = size // 2
-        maze[mid_row, :] = 1
-        gap_cols = {
-            max(1, size // 4),
-            min(size - 2, (3 * size) // 4),
-        }
-        for gc in gap_cols:
-            maze[mid_row, gc] = 0
+    maze = generate_maze(
+        size,
+        maze_type=maze_type,
+        seed=maze_seed,
+        obstacle_rate=obstacle_rate,
+        add_mid_barrier=True,
+    )
 
     path, meta = solve_maze_flow(
         maze,
@@ -648,7 +899,7 @@ def demo(
         fallback_to_shortest=True,
     )
 
-    # Ensure start/goal remain open in case the barrier overlapped them.
+    # Ensure start/goal remain open in case generation overlapped them.
     maze[meta["start"]] = 0
     maze[meta["goal"]] = 0
 

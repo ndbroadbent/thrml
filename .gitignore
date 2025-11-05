@@ -63,6 +63,8 @@ jax_cache/
 *.mp4
 *.avi
 *.mov
+!images/
+!images/*
 maze_solution.png
 demo*.png
 maze_animation.mp4
